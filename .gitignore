@@ -1,0 +1,34 @@
+# Python 仮想環境
+.venv/
+.venv~/
+venv/
+env/
+
+# Python キャッシュ
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 配布物・アーカイブ
+*.zip
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+*.swp
+
+# 実機ごとに異なる設定（サンプルは setting.ini.example を参照）
+**/setting.ini
+
+# 旧作業コピー（lpwa/ が最新版）
+work3/
+
+# ローカル設定
+.claude/
+
+# バイナリ資料（内容未検証のため公開リポジトリには含めない。
+# 掲載する場合は個人名・所属の記載がないか確認してから追加すること）
+*.pdf
+*.docx
+*.pptx
+*.xlsx

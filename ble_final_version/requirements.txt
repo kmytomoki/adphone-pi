@@ -1,0 +1,9 @@
+dbus-python>=1.2.0
+pyserial>=3.5
+hexdump>=3.3
+
+# BLE Peripheral server (BlueZ/DBus backend on Raspberry Pi OS)
+bless==0.3.0
+bleak>=0.22.0
+dbus-next>=0.2.3
+

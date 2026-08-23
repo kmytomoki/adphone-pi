@@ -1,0 +1,21 @@
+[E220-900JP]
+own_address=0  # ノードごとに個別の値を設定すること (0〜65534)
+target_address=65535
+ttl=3
+baud_rate=9600
+bw=125
+sf=7
+subpacket_size=200
+rssi_ambient_noise_flag=0
+transmitting_power=13
+own_channel=0
+rssi_byte_flag=1
+transmission_method_type=2
+wor_cycle=3000
+encryption_key=0
+announce_wait_sec=10
+group_key_hex=  # 32バイトのAES-256グループ鍵を64桁hexで指定: python3 -c "import os;print(os.urandom(32).hex())"
+group_key_id=0
+packet_gap_sec=0.2
+transport_frame_enabled=1
+transport_legacy_fallback=0
