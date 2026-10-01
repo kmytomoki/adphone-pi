@@ -51,6 +51,19 @@ CONFIG_DIR="$SCRIPT_DIR/config_code"
 OP_DIR="$SCRIPT_DIR/operation_code"
 SETTING_INI="$CONFIG_DIR/setting.ini"
 
+# ── ブリッジ本体の場所 ─────────────────────────────────────
+# リポジトリ構成: Raspberry/ble_final_version/、Pi 上の配置: ~/work/ble/（このスクリプトは ~/work/lpwa/sample_code/）
+find_bridge_dir() {
+    local d
+    for d in "$SCRIPT_DIR/../ble_final_version" "$SCRIPT_DIR/../../ble"; do
+        if [[ -f "$d/adphone_ble_lpwa_bridge.py" ]]; then
+            (cd "$d" && pwd)
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── デフォルト設定 ──────────────────────────────────────────
 PORT="/dev/ttyS0"
 OWN_ADDRESS=""
@@ -233,9 +246,8 @@ case "$SUBCOMMAND" in
 
     bridge)
         echo -e "\n${CYAN}=== BLE-LPWA アドホックブリッジ ===${NC}"
-        BRIDGE_DIR="$(cd "$SCRIPT_DIR/../../ble" && pwd)"
+        BRIDGE_DIR="$(find_bridge_dir)" || error "ブリッジスクリプトが見つかりません（../ble_final_version または ../../ble）"
         BRIDGE="$BRIDGE_DIR/adphone_ble_lpwa_bridge.py"
-        [[ -f "$BRIDGE" ]] || error "ブリッジスクリプトが見つかりません: $BRIDGE"
 
         # 仮想環境の python3 を優先使用（bless 等が venv にインストールされているため）
         VENV_PY="$BRIDGE_DIR/.venv/bin/python3"
@@ -323,6 +335,9 @@ case "$SUBCOMMAND" in
         ;;
 
     test)
+        echo -e "\n${CYAN}=== ルーティング Phase 1 テスト (tests/) ===${NC}"
+        (cd "$SCRIPT_DIR" && python3 -m unittest discover -s tests) || warn "tests/ に失敗あり"
+
         echo -e "\n${CYAN}=== adhoc.py 動作確認テスト ===${NC}"
         python3 - <<'PYEOF'
 import sys, struct
@@ -495,7 +510,7 @@ PYEOF
         ACTION="$SERVICE_ACTION"
         SVC="adphone-bridge"
         SVC_FILE="/etc/systemd/system/$SVC.service"
-        BRIDGE_DIR="$(cd "$SCRIPT_DIR/../../ble" 2>/dev/null && pwd || echo "")"
+        BRIDGE_DIR="$(find_bridge_dir || echo "")"
         BRIDGE="$BRIDGE_DIR/adphone_ble_lpwa_bridge.py"
         VENV_PY="$BRIDGE_DIR/.venv/bin/python3"
         [[ -x "$VENV_PY" ]] || VENV_PY="python3"

@@ -17,6 +17,12 @@ adphone_ble_lpwa_bridge.py — Raspberry Pi 4 BLEサーバー
     - TX_CHAR_UUID への Write を受信 → 全接続クライアントへ RX_CHAR_UUID でエコーバック
     - 接続・切断のたびに META_CHAR_UUID へ接続台数(1バイト)を Notify
 
+LPWA 中継:
+    - LoRa はモジュール層では常にブロードキャストで送り、宛先は上位ヘッダで判定する
+    - 中継は 0〜relay_jitter_ms のランダム遅延を置いてから送る（同時再送による衝突を避ける）
+    - 暗号モードでは BLE を起動してから ANNOUNCE を送り、以後も定期的に送り直す。
+      鍵が届く前に BLE から来たメッセージは一定時間保留し、鍵が届いたら送る
+
 UUIDs (ble2.ts と完全一致):
     SERVICE_UUID   : ad000001-ad00-ad00-ad00-ad0000000001
     TX_CHAR_UUID   : ad000001-ad00-ad00-ad00-ad0000000002  (Write)
@@ -28,13 +34,15 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import subprocess
 import sys
+import time
 from typing import Any
 
 # ─── LPWA ヘルパーのインポート ─────────────────────────────────────────────────
-# lora_e220_b.py : ~/work/ble/  (このスクリプトと同じディレクトリ)
-# adhoc.py       : ~/work/lpwa/  または ~/work/lpwa/sample_code/
+# Pi 上の配置    : lora_e220_b.py は ~/work/ble/（このスクリプトと同じ）、adhoc.py 等は ~/work/lpwa/sample_code/
+# リポジトリ構成 : すべて ../lpwa/
 _LPWA_DIR = os.path.join(os.path.dirname(__file__), '..', 'lpwa')
 sys.path.insert(0, os.path.dirname(__file__))          # lora_e220_b 用
 sys.path.insert(0, _LPWA_DIR)                          # adhoc 用
@@ -88,6 +96,7 @@ server: BlessServer | None = None
 _lpwa_send_queue: asyncio.Queue | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 _serial_lock: asyncio.Lock | None = None  # 送信・受信の同時シリアルアクセスを排他制御
+_relay_tasks: "set[asyncio.Task]" = set()  # 遅延中継の待機タスク
 
 # ─── 暗号化モード用グローバル状態 ──────────────────────────────────────────────
 _CRYPTO_MODE: bool = False                       # --crypto で True になる
@@ -95,23 +104,26 @@ _ALLOWED_PEERS: "set[int] | None" = None         # None = 全ノードと鍵交�
 _ed_priv = None                                  # Ed25519PrivateKey (main() で設定)
 _dh_priv = None                                  # X25519PrivateKey  (main() で設定)
 _peer_keys: "dict[int, dict[str, bytes]]" = {}   # addr → {ed_pub, dh_pub}
+_ann_pkt_body: "tuple[bytes, bytes] | None" = None  # (ed_pub, dh_pub) — ANNOUNCE 生成用
+_reannounce_event: asyncio.Event | None = None    # 新しいピアを見つけたら set する
+_last_announce_time: float = 0.0
+_pending_crypto: "list[tuple[float, int, bytes]]" = []  # (受付時刻, 宛先, 平文) — 鍵待ち
+
+_PENDING_MAX = 32               # 鍵待ちで保留するメッセージの上限
+_PENDING_HOLD_SEC = 120         # 鍵待ちで保留する時間
+_REANNOUNCE_MIN_GAP_SEC = 30    # 新ピア検出による再 ANNOUNCE の最短間隔
 
 
 def _load_bridge_config() -> "tuple[int, int]":
-    """setting.ini から ttl と announce_wait_sec を読み込む。"""
-    import configparser as _cp
-    cfg_path = os.path.join(
-        os.path.dirname(__file__), '..', 'lpwa', 'config_code', 'setting.ini'
-    )
-    cfg = _cp.ConfigParser()
-    cfg.read(cfg_path)
-    sec = "E220-900JP"
-    ttl          = int(cfg.get(sec, "ttl",               fallback="3"))
-    announce_sec = int(cfg.get(sec, "announce_wait_sec", fallback="20"))
-    return ttl, announce_sec
+    """setting.ini（lora_e220_b と同じファイル）から ttl と ANNOUNCE 間隔を読み込む。"""
+    cfg = lora_e220_b.load_config_parser()
+    sec = lora_e220_b.CONFIG_SECTION
+    ttl          = int(cfg.get(sec, "ttl",                   fallback="3"))
+    interval_sec = int(cfg.get(sec, "announce_interval_sec", fallback="300"))
+    return ttl, max(30, interval_sec)
 
 
-_DEFAULT_TTL, _ANNOUNCE_WAIT_SEC = _load_bridge_config()
+_DEFAULT_TTL, _ANNOUNCE_INTERVAL_SEC = _load_bridge_config()
 
 
 # ─── BlueZ から BLE (LE) 接続数を非同期で取得 ────────────────────────────────
@@ -223,9 +235,93 @@ def write_request(characteristic: Any, value: Any, **kwargs: Any) -> None:
 
     # ── LPWA 送信キューへ追加 ────────────────────────────────────────────────
     if _lpwa_send_queue is not None and _loop is not None:
-        kind = "crypto_send" if _CRYPTO_MODE else "send"
-        _loop.call_soon_threadsafe(_lpwa_send_queue.put_nowait, (kind, raw))
+        if _CRYPTO_MODE:
+            item = ("crypto_send", (lora_e220_b.TARGET_ADDRESS, raw))
+        else:
+            item = ("send", raw)
+        _loop.call_soon_threadsafe(_lpwa_send_queue.put_nowait, item)
         logger.info("[LPWA TX] キュー追加: %s", text)
+
+
+def _schedule_relay(pkt: bytes) -> None:
+    """中継パケットを 0〜relay_jitter_ms のランダム遅延の後に送信キューへ入れる。
+
+    近くのノードが同じパケットを同時に再送して衝突するのを避けるため。
+    """
+    if _lpwa_send_queue is None:
+        return
+    delay = random.uniform(0, lora_e220_b.RELAY_JITTER_SEC)
+
+    async def _delayed() -> None:
+        await asyncio.sleep(delay)
+        await _lpwa_send_queue.put(("relay", pkt))
+
+    task = asyncio.get_running_loop().create_task(_delayed())
+    _relay_tasks.add(task)               # 参照を保持しないと GC で消えることがある
+    task.add_done_callback(_relay_tasks.discard)
+
+
+def _hold_pending(target: int, data: bytes) -> None:
+    """宛先の鍵が届くまでメッセージを保留する（古いものから捨てる）。"""
+    now = time.monotonic()
+    _pending_crypto[:] = [p for p in _pending_crypto if now - p[0] < _PENDING_HOLD_SEC]
+    if len(_pending_crypto) >= _PENDING_MAX:
+        dropped = _pending_crypto.pop(0)
+        logger.warning("[CRYPTO TX] 保留数の上限。最も古い 0x%04X 宛てを破棄", dropped[1])
+    _pending_crypto.append((now, target, data))
+
+
+def _flush_pending(peer_addr: int) -> None:
+    """peer_addr の鍵が届いたら、その宛先に保留していたメッセージを送信キューへ戻す。"""
+    if _lpwa_send_queue is None:
+        return
+    now = time.monotonic()
+    remaining = []
+    for t, target, data in _pending_crypto:
+        if now - t >= _PENDING_HOLD_SEC:
+            logger.warning("[CRYPTO TX] 0x%04X 宛ての保留メッセージが期限切れ", target)
+        elif target == peer_addr:
+            _lpwa_send_queue.put_nowait(("crypto_send", (target, data)))
+            logger.info("[CRYPTO TX] 0x%04X の鍵を受信。保留メッセージを送信", target)
+        else:
+            remaining.append((t, target, data))
+    _pending_crypto[:] = remaining
+
+
+def _build_announce() -> bytes:
+    ed_pub_b, dh_pub_b = _ann_pkt_body
+    return crypto.encode_announce(
+        lora_e220_b.SELF_ADDRESS, ed_pub_b, dh_pub_b, ttl=_DEFAULT_TTL)
+
+
+async def _announce_loop() -> None:
+    """ANNOUNCE を起動直後・数秒後・以後 announce_interval_sec ごとに送る。
+
+    新しいピアを見つけたとき（_reannounce_event）も、相手がこちらの鍵を
+    知らない可能性があるので、少し待ってから送り直す。
+    """
+    global _last_announce_time
+    # 同時に起動したノード同士が取りこぼさないよう、起動直後に 2 回送る
+    schedule = [0.0, random.uniform(5, 15)]
+    while True:
+        if schedule:
+            timeout = schedule.pop(0)
+        else:
+            timeout = _ANNOUNCE_INTERVAL_SEC * random.uniform(0.9, 1.1)
+        try:
+            await asyncio.wait_for(_reannounce_event.wait(), timeout=timeout)
+            _reannounce_event.clear()
+            # 新ピア起因: 直近に送っていれば間隔を空ける。多数のノードが一斉に返さないよう散らす
+            since = time.monotonic() - _last_announce_time
+            if since < _REANNOUNCE_MIN_GAP_SEC:
+                await asyncio.sleep(_REANNOUNCE_MIN_GAP_SEC - since)
+            await asyncio.sleep(random.uniform(0.5, 3.0))
+        except asyncio.TimeoutError:
+            pass
+        _last_announce_time = time.monotonic()
+        await _lpwa_send_queue.put(("announce", _build_announce()))
+        logger.info("[ANNOUNCE] 公開鍵をブロードキャスト (既知ピア: %s)",
+                    ["0x{:04X}".format(a) for a in sorted(_peer_keys)] or "なし")
 
 
 # ─── LPWA 送信タスク ────────────────────────────────────────────────────────────
@@ -233,9 +329,10 @@ async def _lpwa_sender() -> None:
     """キューからデータを取り出して LPWA 送信（run_in_executor でブロッキングI/O分離）
 
     キュー要素は (kind, data) タプル:
-      ("send",         raw) : BLE 生データ → adhoc.encode() して送信（平文モード）
-      ("crypto_send",  raw) : BLE 生データ → crypto.encode_data() して送信（暗号モード）
-      ("relay", adhoc_pkt)  : 中継パケット → そのまま送信（ヘッダ付き済み）
+      ("send",         raw)            : BLE 生データ → adhoc.encode() して送信（平文モード）
+      ("crypto_send",  (target, raw))  : BLE 生データ → crypto.encode_data() して送信（暗号モード）
+      ("relay",        pkt)            : 中継パケット → そのまま送信（ヘッダ付き済み）
+      ("announce",     pkt)            : ANNOUNCE → そのまま送信
     """
     loop = asyncio.get_running_loop()
     while True:
@@ -244,22 +341,28 @@ async def _lpwa_sender() -> None:
         if kind == "send":
             pkt = adhoc.encode(data, lora_e220_b.SELF_ADDRESS, ttl=adhoc.DEFAULT_TTL)
         elif kind == "crypto_send":
-            target = lora_e220_b.TARGET_ADDRESS
-            peer   = _peer_keys.get(target)
+            target, plaintext = data
+            if target == crypto.BROADCAST_ADDR:
+                logger.error("[CRYPTO TX] 暗号モードの宛先がブロードキャスト(0xFFFF)です。"
+                             "--target-address で相手ノードを指定してください。送信スキップ")
+                continue
+            peer = _peer_keys.get(target)
             if peer is None:
-                logger.warning("[CRYPTO TX] 宛先 0x%04X の鍵が未登録。送信スキップ", target)
+                _hold_pending(target, plaintext)
+                logger.warning("[CRYPTO TX] 宛先 0x%04X の鍵が未登録。鍵が届くまで最大 %d 秒保留",
+                               target, _PENDING_HOLD_SEC)
                 continue
             try:
                 shared_key = crypto.derive_shared_key(_dh_priv, peer["dh_pub"])
                 pkt = crypto.encode_data(
-                    lora_e220_b.SELF_ADDRESS, target, data,
+                    lora_e220_b.SELF_ADDRESS, target, plaintext,
                     shared_key, _ed_priv, ttl=_DEFAULT_TTL)
                 logger.info("[CRYPTO TX] → 0x%04X  %d bytes (暗号化済み)", target, len(pkt))
             except Exception as e:
                 logger.error("[CRYPTO TX] 暗号化失敗: %s", e)
                 continue
         else:
-            pkt = data   # relay: そのまま転送
+            pkt = data   # relay / announce: そのまま送信
 
         async with _serial_lock:
             try:
@@ -275,7 +378,8 @@ async def _lpwa_receiver() -> None:
     loop = asyncio.get_running_loop()
     while True:
         async with _serial_lock:
-            raw = await loop.run_in_executor(None, lora_recv, 2)
+            # 短めに区切って送信タスクにシリアルを譲る（受信途中のフレームは次回へ持ち越される）
+            raw = await loop.run_in_executor(None, lora_recv, 0.5)
 
         if raw is None:
             await asyncio.sleep(0.05)
@@ -292,8 +396,8 @@ async def _lpwa_receiver() -> None:
             logger.info("[ADHOC RX] src=0x%04X ttl=%d: %s", src_addr, ttl, text)
             _notify_ble_rx(text)
             relay_pkt = adhoc.make_relay(raw)
-            if relay_pkt is not None and _lpwa_send_queue is not None:
-                await _lpwa_send_queue.put(("relay", relay_pkt))
+            if relay_pkt is not None:
+                _schedule_relay(relay_pkt)
                 logger.info("[ADHOC RELAY] src=0x%04X ttl %d → %d", src_addr, ttl, ttl - 1)
             await asyncio.sleep(0.05)
             continue
@@ -319,8 +423,8 @@ async def _lpwa_receiver() -> None:
         if ptype == crypto.TYPE_ANNOUNCE:
             _handle_announce_packet(raw)
             relay = crypto.make_relay(raw)
-            if relay and _lpwa_send_queue is not None:
-                await _lpwa_send_queue.put(("relay", relay))
+            if relay:
+                _schedule_relay(relay)
                 logger.info("[RELAY-ANN] src=0x%04X ttl %d → %d", src, ttl, ttl - 1)
 
         # DATA パケット
@@ -351,16 +455,24 @@ async def _lpwa_receiver() -> None:
                 # BROADCAST の場合は中継も行う
                 if dest == crypto.BROADCAST_ADDR:
                     relay = crypto.make_relay(raw)
-                    if relay and _lpwa_send_queue is not None:
-                        await _lpwa_send_queue.put(("relay", relay))
+                    if relay:
+                        _schedule_relay(relay)
             else:
                 # 他者宛ユニキャスト → 中継のみ
                 _log_ciphertext_preview(raw, src, dest, mid)
                 relay = crypto.make_relay(raw)
-                if relay and _lpwa_send_queue is not None:
-                    await _lpwa_send_queue.put(("relay", relay))
+                if relay:
+                    _schedule_relay(relay)
                     logger.info("[RELAY] src=0x%04X dst=0x%04X ttl %d → %d",
                                 src, dest, ttl, ttl - 1)
+
+        # GROUP_DATA パケット（ブリッジは復号しないが、メッシュを切らないよう中継する）
+        elif ptype == crypto.TYPE_GROUP_DATA:
+            if src != lora_e220_b.SELF_ADDRESS:
+                relay = crypto.make_relay(raw)
+                if relay:
+                    _schedule_relay(relay)
+                    logger.info("[RELAY-GBCAST] src=0x%04X ttl %d → %d", src, ttl, ttl - 1)
 
         await asyncio.sleep(0.05)
 
@@ -392,10 +504,17 @@ def _handle_announce_packet(raw: bytes) -> None:
     if _ALLOWED_PEERS is not None and src not in _ALLOWED_PEERS:
         logger.info("[SKIP ] ANNOUNCE src=0x%04X → 鍵交換対象外（--peer 指定外）", src)
         return
-    _peer_keys[src] = {"ed_pub": info["ed_pub"], "dh_pub": info["dh_pub"]}
+    new_keys = {"ed_pub": info["ed_pub"], "dh_pub": info["dh_pub"]}
+    if _peer_keys.get(src) == new_keys:
+        return  # 定期 ANNOUNCE — 既知の鍵
+    _peer_keys[src] = new_keys
     logger.info("[PEER ] 0x%04X の公開鍵を登録", src)
     logger.info("        Ed25519 = %s...", info["ed_pub"].hex()[:32])
     logger.info("        X25519  = %s...", info["dh_pub"].hex()[:32])
+    # 新しい（または再起動した）ピアはこちらの鍵を知らないかもしれないので ANNOUNCE を返す
+    if _reannounce_event is not None:
+        _reannounce_event.set()
+    _flush_pending(src)
 
 
 def _log_ciphertext_preview(raw: bytes, src: int, dest: int, mid: int) -> None:
@@ -407,52 +526,10 @@ def _log_ciphertext_preview(raw: bytes, src: int, dest: int, mid: int) -> None:
     logger.info("        raw bytes: %s", preview)
 
 
-async def _announce_phase() -> None:
-    """Phase 2: ANNOUNCE ブロードキャスト送信 + _ANNOUNCE_WAIT_SEC 秒間受信待機。
-    BLE タスク起動前に呼ぶため _serial_lock との競合なし。"""
-    loop = asyncio.get_running_loop()
-
-    ed_pub_b = _ed_priv.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    dh_pub_b = _dh_priv.public_key().public_bytes(
-        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-
-    ann_pkt = crypto.encode_announce(
-        lora_e220_b.SELF_ADDRESS, ed_pub_b, dh_pub_b, ttl=_DEFAULT_TTL)
-    await loop.run_in_executor(None, lora_send, ann_pkt)
-
-    logger.info("=" * 60)
-    logger.info("[ANNOUNCE] 公開鍵ブロードキャスト送信 (%d bytes)", len(ann_pkt))
-    logger.info("[ANNOUNCE] Ed25519 pub: %s...", ed_pub_b.hex()[:32])
-    logger.info("[ANNOUNCE] X25519  pub: %s...", dh_pub_b.hex()[:32])
-    logger.info("[ANNOUNCE] %d 秒間 ピア公開鍵を受信待機...", _ANNOUNCE_WAIT_SEC)
-    logger.info("[INIT] BLE 起動を %d 秒間延期 (ANNOUNCE 待機中)", _ANNOUNCE_WAIT_SEC)
-    logger.info("=" * 60)
-
-    deadline = loop.time() + _ANNOUNCE_WAIT_SEC
-    while loop.time() < deadline:
-        remaining = max(1, int(deadline - loop.time()))
-        raw = await loop.run_in_executor(None, lora_recv, min(2, remaining))
-        if raw is None:
-            continue
-        hdr = crypto.parse_header(raw)
-        if hdr is None or crypto.is_seen(hdr["src_addr"], hdr["msg_id"]):
-            continue
-        if hdr["type"] == crypto.TYPE_ANNOUNCE:
-            _handle_announce_packet(raw)
-            relay = crypto.make_relay(raw)
-            if relay:
-                await loop.run_in_executor(None, lora_send, relay)
-
-    known = list(_peer_keys.keys())
-    logger.info("[READY] 鍵交換済みピア: %s",
-                ["0x{:04X}".format(a) for a in known] if known else "なし")
-    logger.info("=" * 60)
-
-
 # ─── メイン ────────────────────────────────────────────────────────────────────
 async def main() -> None:
     global server, _lpwa_send_queue, _loop, _serial_lock, _ed_priv, _dh_priv
+    global _ann_pkt_body, _reannounce_event
 
     _loop = asyncio.get_running_loop()
     _lpwa_send_queue = asyncio.Queue()
@@ -487,9 +564,12 @@ async def main() -> None:
         else:
             logger.info("       鍵交換相手: すべてのノード")
         logger.info("=" * 60)
-
-        # ── Phase 2: ANNOUNCE ウィンドウ（BLE タスク起動前に完了させる）────
-        await _announce_phase()
+        if lora_e220_b.TARGET_ADDRESS == crypto.BROADCAST_ADDR:
+            logger.error("[INIT] 暗号モードの送信先がブロードキャスト(0xFFFF)のため、"
+                         "BLE からのメッセージは送信されません。--target-address を指定してください")
+        _ann_pkt_body = (ed_pub_b, dh_pub_b)
+        _reannounce_event = asyncio.Event()
+        # ANNOUNCE は BLE 起動後に _announce_loop() が送る（鍵収集のために BLE を止めない）
     else:
         logger.info("[INIT] 平文モード  self=0x%04X", lora_e220_b.SELF_ADDRESS)
 
@@ -549,6 +629,8 @@ async def main() -> None:
         asyncio.create_task(_lpwa_sender()),
         asyncio.create_task(_lpwa_receiver()),
     ]
+    if _CRYPTO_MODE:
+        tasks.append(asyncio.create_task(_announce_loop()))
     logger.info("LPWA統合モードで起動 (送信・受信タスク開始)")
 
     try:

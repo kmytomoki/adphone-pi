@@ -44,6 +44,7 @@ adhoc.py はそのまま残し、本ファイルは独立した暗号メッシ�
 """
 
 import os
+import random
 import struct
 from collections import deque
 
@@ -74,7 +75,8 @@ _GROUP_PL_SIZE   = struct.calcsize(_GROUP_PL_FORMAT)  # 77 bytes
 # ── 重複検知キャッシュ ────────────────────────────────────────
 _SEEN_MAXLEN = 128
 _seen: deque[tuple[int, int]] = deque(maxlen=_SEEN_MAXLEN)
-_seq: int = 0
+# 送信連番。起動ごとに乱数から始める（adhoc.py と同じ理由）
+_seq: int = random.getrandbits(16)
 
 
 def _next_seq() -> int:
