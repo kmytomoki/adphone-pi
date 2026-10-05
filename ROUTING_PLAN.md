@@ -194,10 +194,42 @@ ANNOUNCE を受けたとき、またはパケットを受けたときに更新�
 
 実機の台数が限られるため、アルゴリズムは先にシミュレータで検証する。
 
-- [ ] `lora_send` / `lora_recv` を差し替えられる無線インターフェースに抽象化する（`radio.py`）
-- [ ] プロセス内の仮想無線（トポロジ・RSSI・送信時間・衝突・ロス率を再現）を作る（`sim/`）
-- [ ] シナリオ: 直線 5 台、格子 9 台、20 台をランダム配置、ノードの途中離脱
-- [ ] 指標: 到達率、総送信回数（1 通あたり）、遅延、衝突数
+- [x] `lora_send` / `lora_recv` を差し替えられる無線インターフェースに抽象化する（`mesh/core.py` の `RadioPort` / `NodeContext`）
+- [x] プロセス内の仮想無線（トポロジ・RSSI・送信時間・衝突・ロス率を再現）を作る（`sim/`）
+- [x] シナリオ: 直線 5 台、格子 9 台、20 台をランダム配置、ノードの途中離脱
+- [x] 指標: 到達率、総送信回数（1 通あたり）、遅延、衝突数
+
+実装メモ（2026-10-01）:
+- ルーティングは `mesh/` の **イベント駆動の Router** として書く（`on_receive` / `ctx.call_later` / `ctx.transmit`）。
+  同じ Router を `sim/`（仮想時刻）と `mesh/realtime.py`（実機, `E220Port`）の両方で動かせる
+- 現行ルーティングを `mesh/flood_v1.py` に移植し、ベースラインにした（ブリッジ・node_mesh.py はまだ旧コードのまま。Phase 3 で `mesh/` に切り替える）
+- 実行: `cd lpwa && python3 -m sim`（`--help` で TTL・ジッタ・SF・キャリアセンスなどを変更、`--json` で保存）
+- 無線モデルの数値（減衰指数 3.0・シャドウイング 4dB・感度 -123dBm など）は代表値。**絶対値ではなくアルゴリズム間の比較に使う**。実機の RSSI・到達距離が取れたら `sim/radio.py` の `RadioParams` を合わせる
+
+#### ベースライン（flood_v1, 20 seed 平均, 60 メッセージ・平均 10 秒間隔・ユニキャスト 7 割）
+
+| 条件 | シナリオ | ユニキャスト到達 | ブロードキャスト到達 | 送信数/ブロードキャスト | 衝突率 | 遅延 p95 |
+|---|---|---|---|---|---|---|
+| 現行（TTL 3, ジッタ 500ms, ANNOUNCE 300 秒） | line5 | 75.6% | 77.9% | 3.5 | 10.4% | 2.24s |
+| 同上 | grid9 | 74.7% | 75.0% | 5.8 | 31.3% | 2.14s |
+| 同上 | random20 | **74.7%** | **79.6%** | **12.9** | **45.9%** | 2.15s |
+| 同上 | churn20 | 78.0% | 77.7% | 11.4 | 44.2% | 2.19s |
+| TTL 5 | random20 | 82.3% | 87.5% | 17.0 | 46.4% | 3.10s |
+| ANNOUNCE 30 秒（node_mesh.py の設定） | random20 | 54.1% | 54.9% | 8.8 | 48.1% | 2.19s |
+| メッセージ間隔 3 秒 | random20 | 66.6% | 67.1% | 10.8 | 46.5% | 2.13s |
+| ジッタ 0ms | random20 | 73.6% | 74.1% | 12.2 | 40.1% | 1.57s |
+| キャリアセンス -80dBm | random20 | 75.7% | 79.5% | 12.9 | 46.0% | 2.17s |
+
+（衝突率 = 受信判定のうち衝突で失った割合。同じパケットの重複受信も分母に含む）
+
+分かったこと:
+1. **主な損失要因は衝突**。20 台では受信の約 46% が衝突で失われ、宛先が TTL 圏内でも 4 回に 1 回届かない
+2. **500ms のジッタはほとんど効いていない**（0ms と比べて到達率 +1〜4 ポイント）。1 パケットの送信時間が約 230ms（UART 転送を含めると約 380ms）に対して窓が狭すぎる。Phase 3 の管理型フラッディング（RSSI に応じた待ち時間 + 他ノードの再送を聞いたら取りやめる）で改善する
+3. **ARIB のキャリアセンス（-80dBm）は効かない**。メッシュの隣ノードは感度付近（-115〜-120dBm）で届くため、-80dBm の閾値では検知できない
+4. **node_mesh.py の 30 秒 ANNOUNCE は 20 台で網を飽和させる**（到達率 54%）。Phase 3 では ANNOUNCE を減らす（ブリッジは 300 秒）
+5. TTL を 5 に上げると到達率は上がる（冗長な経路が増えるため）が、送信数も 1.3 倍になる
+
+Phase 3 の完了条件の比較対象: random20 のブロードキャスト到達率 **79.6%**・送信数 **12.9 / メッセージ**。
 
 ### Phase 3: v2 パケット + 管理型フラッディング（目安 2 週間）
 
@@ -235,20 +267,29 @@ ANNOUNCE を受けたとき、またはパケットを受けたときに更新�
 
 ```
 Raspberry/
-  mesh/                     # 新規: ルーティングのコア（無線に依存しない）
-    packet.py               #   v2 パケットの encode/decode、分割
-    router.py               #   管理型フラッディング、DIRECT、重複キャッシュ
-    reliability.py          #   ACK 待ち、再送、送信予算
-    nodedb.py               #   NodeDB、経路キャッシュ、永続化
-    identity.py             #   永続鍵、TOFU、ANNOUNCE の署名と検証
-    store.py                #   蓄積転送
-  radio/
-    e220.py                 #   lora_e220_b.py を整理（常に 0xFFFF、ストリームでフレーム分解）
-    sim.py                  #   仮想無線
+  lpwa/                       # Pi 上では ~/work/lpwa/sample_code/ に配置されるため、新規コードもこの下に置く
+    mesh/                     # ルーティングのコア（無線・時刻に依存しない）
+      core.py                 #   [Phase 2] Router / NodeContext / RadioPort の定義
+      flood_v1.py             #   [Phase 2] 現行ルーティング（ベースライン）
+      realtime.py             #   [Phase 2] 実機ランタイム（E220Port + タイマー）
+      packet.py               #   v2 パケットの encode/decode、分割
+      router.py               #   管理型フラッディング、DIRECT、重複キャッシュ
+      reliability.py          #   ACK 待ち、再送、送信予算
+      nodedb.py               #   NodeDB、経路キャッシュ、永続化
+      identity.py             #   永続鍵、TOFU、ANNOUNCE の署名と検証
+      store.py                #   蓄積転送
+    sim/                      # [Phase 2] 離散イベントシミュレータ（python3 -m sim）
+      radio.py                #   無線モデル（送信時間・減衰・衝突・半二重）
+      engine.py               #   イベントループ、仮想ノード
+      scenarios.py            #   トポロジとメッセージの流し方
+      metrics.py              #   集計
+    lora_e220_b.py            #   E220 ドライバ（Phase 1 で常に 0xFFFF・ストリーム分解に変更済み）
+    tests/
   ble_final_version/
     adphone_ble_lpwa_bridge.py  # mesh/ を呼ぶだけの薄い層にする
-  tests/
 ```
+
+当初案の `Raspberry/mesh/`・`Raspberry/radio/` から変更した。Pi 上の配置（`~/work/ble/` と `~/work/lpwa/sample_code/`）にそのまま載せられるようにするため。
 
 `lpwa/adhoc.py` / `adhoc_crypto.py` / `node_mesh.py` は Phase 3 の完了後に削除するか、`legacy/` に移す。
 

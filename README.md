@@ -193,6 +193,19 @@ BlueZ の状態が壊れた場合のみ実行する。**毎回実行するとボ
 - **暗号メッシュ（`adhoc_crypto.py`）** — グループ鍵での暗復号、`key_id` 不一致の検出、
   誤ったグループ鍵での `InvalidTag`、別人の署名での `InvalidSignature`、
   GROUP_DATA の中継時に TTL と type が保たれること、X25519 ECDH によるユニキャストの往復
+- **`lpwa/tests/`** — E220 のフレーム分解、設定ファイルの読み込み、ブリッジの鍵待ち保留、
+  シミュレータの無線モデル（送信時間・衝突・半二重）、現行ルーティングの TTL の振る舞い
+
+### ルーティングシミュレータ
+
+実機なしでルーティングの性能（到達率・送信数・衝突・遅延）を比べられる。詳細とベースラインの数値は
+[ROUTING_PLAN.md](ROUTING_PLAN.md) の Phase 2 を参照。
+
+```bash
+cd lpwa
+python3 -m sim                       # 全シナリオ（直線 5 台・格子 9 台・ランダム 20 台・途中停止）
+python3 -m sim --scenario random20 --ttl 5 --seeds 20
+```
 
 ---
 
