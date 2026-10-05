@@ -17,7 +17,13 @@ adphone_ble_lpwa_bridge.py — Raspberry Pi 4 BLEサーバー
     - TX_CHAR_UUID への Write を受信 → 全接続クライアントへ RX_CHAR_UUID でエコーバック
     - 接続・切断のたびに META_CHAR_UUID へ接続台数(1バイト)を Notify
 
-LPWA 中継:
+LPWA:
+    既定は v2（lpwa/mesh/ の管理型フラッディング。ROUTING_PLAN.md Phase 3）。
+    設定は setting.ini（hop_limit / role / node_name / group_key_hex など。mesh/config.py 参照）。
+    送信先 TARGET_ADDRESS が 0xFFFF ならグループ鍵でブロードキャスト、それ以外はその相手へ暗号化して送る。
+    --legacy を付けると以下の v1（adhoc / adhoc_crypto）で動く。全ノードを同じ方式にそろえること。
+
+LPWA 中継（v1 / --legacy）:
     - LoRa はモジュール層では常にブロードキャストで送り、宛先は上位ヘッダで判定する
     - 中継は 0〜relay_jitter_ms のランダム遅延を置いてから送る（同時再送による衝突を避ける）
     - 暗号モードでは BLE を起動してから ANNOUNCE を送り、以後も定期的に送り直す。
@@ -37,6 +43,7 @@ import os
 import random
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -108,6 +115,11 @@ _ann_pkt_body: "tuple[bytes, bytes] | None" = None  # (ed_pub, dh_pub) — ANNOU
 _reannounce_event: asyncio.Event | None = None    # 新しいピアを見つけたら set する
 _last_announce_time: float = 0.0
 _pending_crypto: "list[tuple[float, int, bytes]]" = []  # (受付時刻, 宛先, 平文) — 鍵待ち
+
+# ─── v2（mesh/）用 ──────────────────────────────────────────────────────────────
+_LEGACY: bool = False                            # --legacy で True（v1 で動かす）
+_mesh_node = None                                # mesh.realtime.RealtimeNode
+_mesh_stop = threading.Event()
 
 _PENDING_MAX = 32               # 鍵待ちで保留するメッセージの上限
 _PENDING_HOLD_SEC = 120         # 鍵待ちで保留する時間
@@ -232,6 +244,12 @@ def write_request(characteristic: Any, value: Any, **kwargs: Any) -> None:
     echo_char.value = bytearray(text.encode("utf-8"))
     server.update_value(SERVICE_UUID, RX_CHAR_UUID)
     logger.info("[ECHO] → 全 %d 台へ送信: %s", _notified_count, text)
+
+    # ── v2: メッシュのスレッドに送信を頼む ──────────────────────────────────
+    if _mesh_node is not None:
+        dest = lora_e220_b.TARGET_ADDRESS
+        _mesh_node.post(lambda: _mesh_send(dest, raw))
+        return
 
     # ── LPWA 送信キューへ追加 ────────────────────────────────────────────────
     if _lpwa_send_queue is not None and _loop is not None:
@@ -526,6 +544,62 @@ def _log_ciphertext_preview(raw: bytes, src: int, dest: int, mid: int) -> None:
     logger.info("        raw bytes: %s", preview)
 
 
+# ─── v2（mesh/）────────────────────────────────────────────────────────────────
+def _mesh_send(dest: int, raw: bytes) -> None:
+    """メッシュのスレッドで呼ばれる。"""
+    from mesh import packet as P
+    try:
+        key = _mesh_node.router.send(dest, raw)
+        logger.info("[MESH TX] → %s msg_id=%08X %d bytes",
+                    "全体" if dest == P.BROADCAST_ADDR else "0x{:04X}".format(dest),
+                    key.msg_id, len(raw))
+    except (ValueError, P.PacketError) as e:
+        logger.error("[MESH TX] 送れません: %s", e)
+
+
+def _mesh_on_deliver(d) -> None:
+    """メッシュのスレッドで呼ばれる。BLE への通知はイベントループに渡す。"""
+    text = d.payload.decode("utf-8", errors="replace")
+    logger.info("[MESH RX] 0x%04X（%s ホップ）: %s", d.src, d.hops, text)
+    if _loop is not None:
+        _loop.call_soon_threadsafe(_notify_ble_rx, text)
+
+
+def _mesh_on_event(event: str, info: dict) -> None:
+    if event == "key_conflict":
+        logger.warning("[MESH] 0x%04X が登録済みと違う鍵で名乗っています（指紋 %s）。"
+                       "ノードを入れ替えたなら python3 -m mesh.nodedb <nodedb.json> forget %d",
+                       info["addr"], info["fingerprint"], info["addr"])
+    elif event == "peer":
+        logger.info("[MESH] ピア 0x%04X %s %s（指紋 %s）", info["addr"], info["role"],
+                    info["name"], info["fingerprint"])
+    else:
+        logger.info("[MESH] %s %s", event, info)
+
+
+def _start_mesh() -> threading.Thread:
+    global _mesh_node
+    from mesh.config import load_mesh_config, make_router_factory
+    from mesh.realtime import E220Port, RealtimeNode
+
+    mc = load_mesh_config(lora_e220_b.load_config_parser(), lora_e220_b.CONFIG_PATH)
+    mc.address = lora_e220_b.SELF_ADDRESS          # --self-address を反映
+    factory, identity, _ = make_router_factory(mc, on_event=_mesh_on_event)
+    _mesh_node = RealtimeNode(E220Port(), factory, address=mc.address, on_deliver=_mesh_on_deliver)
+    logger.info("[INIT] v2 メッシュ  self=0x%04X  役割=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
+                mc.address, mc.role, mc.hop_limit, identity.fingerprint,
+                "あり" if mc.group_key else "なし")
+    if lora_e220_b.TARGET_ADDRESS == 0xFFFF and mc.group_key is None:
+        logger.error("[INIT] 送信先がブロードキャストですが group_key_hex が未設定です。"
+                     "BLE からのメッセージは送れません")
+    thread = threading.Thread(
+        target=_mesh_node.run_forever, args=(_mesh_stop,),
+        kwargs={"on_error": lambda e: logger.exception("[MESH] ループでエラー: %s", e)},
+        name="mesh", daemon=True)
+    thread.start()
+    return thread
+
+
 # ─── メイン ────────────────────────────────────────────────────────────────────
 async def main() -> None:
     global server, _lpwa_send_queue, _loop, _serial_lock, _ed_priv, _dh_priv
@@ -536,11 +610,14 @@ async def main() -> None:
     _serial_lock = asyncio.Lock()
 
     ttl_display = _DEFAULT_TTL if _CRYPTO_MODE else adhoc.DEFAULT_TTL
-    logger.info("LPWA アドレス: SELF=0x%04X  TARGET=0x%04X  CH=0x%02X  TTL=%d",
+    logger.info("LPWA アドレス: SELF=0x%04X  TARGET=0x%04X  CH=0x%02X%s",
                 lora_e220_b.SELF_ADDRESS, lora_e220_b.TARGET_ADDRESS,
-                lora_e220_b.TARGET_CHANNEL, ttl_display)
+                lora_e220_b.TARGET_CHANNEL, "  TTL=%d (v1)" % ttl_display if _LEGACY else "")
 
-    if _CRYPTO_MODE:
+    mesh_thread = None
+    if not _LEGACY:
+        mesh_thread = _start_mesh()
+    elif _CRYPTO_MODE:
         if not _CRYPTO_AVAILABLE:
             logger.error("[ERROR] --crypto が指定されましたが cryptography ライブラリが見つかりません。")
             logger.error("        pip install cryptography を実行してください。")
@@ -571,7 +648,7 @@ async def main() -> None:
         _reannounce_event = asyncio.Event()
         # ANNOUNCE は BLE 起動後に _announce_loop() が送る（鍵収集のために BLE を止めない）
     else:
-        logger.info("[INIT] 平文モード  self=0x%04X", lora_e220_b.SELF_ADDRESS)
+        logger.info("[INIT] 平文モード (v1)  self=0x%04X", lora_e220_b.SELF_ADDRESS)
 
     server = BlessServer(name="Adphone")
     server.read_request_func = read_request
@@ -624,14 +701,17 @@ async def main() -> None:
 
     poll_task = asyncio.create_task(_poll_connections())
 
-    tasks = [
-        poll_task,
-        asyncio.create_task(_lpwa_sender()),
-        asyncio.create_task(_lpwa_receiver()),
-    ]
-    if _CRYPTO_MODE:
-        tasks.append(asyncio.create_task(_announce_loop()))
-    logger.info("LPWA統合モードで起動 (送信・受信タスク開始)")
+    tasks = [poll_task]
+    if _LEGACY:
+        tasks += [
+            asyncio.create_task(_lpwa_sender()),
+            asyncio.create_task(_lpwa_receiver()),
+        ]
+        if _CRYPTO_MODE:
+            tasks.append(asyncio.create_task(_announce_loop()))
+        logger.info("LPWA統合モード (v1) で起動 (送信・受信タスク開始)")
+    else:
+        logger.info("LPWA統合モード (v2 メッシュ) で起動")
 
     try:
         stop_event = asyncio.Event()
@@ -645,12 +725,15 @@ async def main() -> None:
                 await t
             except asyncio.CancelledError:
                 pass
+        if mesh_thread is not None:
+            _mesh_stop.set()
+            await asyncio.get_running_loop().run_in_executor(None, mesh_thread.join, 2)
         await server.stop()
         logger.info("BLEサーバー停止")
 
 
 if __name__ == "__main__":
-    _parser = argparse.ArgumentParser(description="Adphone BLE-LPWA ブリッジサーバー")
+    _parser = argparse.ArgumentParser(description="ADREN BLE-LPWA ブリッジサーバー")
     _parser.add_argument(
         "--target-address",
         type=lambda x: int(x, 0),
@@ -667,21 +750,30 @@ if __name__ == "__main__":
         "--ttl",
         type=int,
         metavar="N",
-        help="アドホック TTL（1〜255, デフォルト: setting.ini の値）",
+        help="[v1] アドホック TTL（1〜255, デフォルト: setting.ini の値）",
     )
     _parser.add_argument(
         "--crypto",
         action="store_true",
-        help="公開鍵暗号化を有効にする（ANNOUNCE + X25519 + AES-GCM + Ed25519）",
+        help="[v1] 公開鍵暗号化を有効にする（ANNOUNCE + X25519 + AES-GCM + Ed25519）",
     )
     _parser.add_argument(
         "--peer",
         type=lambda x: int(x, 0),
         action="append",
         metavar="ADDR",
-        help="鍵交換する相手アドレス（省略: 全ノード, 例: --peer 2 --peer 3）",
+        help="[v1] 鍵交換する相手アドレス（省略: 全ノード, 例: --peer 2 --peer 3）",
+    )
+    _parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="v1（adhoc / adhoc_crypto）で動かす。--ttl / --crypto / --peer は v1 専用",
     )
     _args = _parser.parse_args()
+    _LEGACY = _args.legacy
+    if not _LEGACY and (_args.ttl is not None or _args.crypto or _args.peer):
+        logger.warning("--ttl / --crypto / --peer は v1（--legacy）専用のため無視します。"
+                       "v2 は setting.ini の hop_limit を使い、常に暗号化します")
 
     if _args.target_address is not None:
         lora_e220_b.TARGET_ADDRESS = _args.target_address

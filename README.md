@@ -194,7 +194,19 @@ BlueZ の状態が壊れた場合のみ実行する。**毎回実行するとボ
   誤ったグループ鍵での `InvalidTag`、別人の署名での `InvalidSignature`、
   GROUP_DATA の中継時に TTL と type が保たれること、X25519 ECDH によるユニキャストの往復
 - **`lpwa/tests/`** — E220 のフレーム分解、設定ファイルの読み込み、ブリッジの鍵待ち保留、
-  シミュレータの無線モデル（送信時間・衝突・半二重）、現行ルーティングの TTL の振る舞い
+  シミュレータの無線モデル（送信時間・衝突・半二重）、現行ルーティングの TTL の振る舞い、
+  v2 のパケット・分割・暗号・TOFU・中継の取りやめ・鍵の要求、ブリッジ v2 の BLE ↔ メッシュ往復
+
+### v2 メッシュ（管理型フラッディング）
+
+ブリッジ（`./lpwa.sh bridge`）とメッシュノード（`./lpwa.sh mesh` → `mesh_node.py`）は v2 で動く。
+旧方式は `--legacy` を付ける（**全ノードを同じ方式にそろえること**。v1 と v2 は通信できない）。
+
+- 中継: 受信 RSSI と隣ノード数で待ち時間を決め、待っている間に他のノードの中継を聞いたら取りやめる
+- 暗号: ユニキャストは X25519 + AES-GCM（署名なし）、ブロードキャストはグループ鍵 + Ed25519 署名
+- 鍵: `lpwa/config_code/state/identity.key` に保存し、再起動しても変えない。他ノードの鍵は最初に受け取ったものに固定（TOFU）
+- 設定（`setting.ini`）: `hop_limit` / `role`（CLIENT・ROUTER・CLIENT_MUTE）/ `node_name` / `group_key_hex`
+- 設計とシミュレーション結果: [ROUTING_PLAN.md](ROUTING_PLAN.md) の Phase 3
 
 ### ルーティングシミュレータ
 
@@ -205,6 +217,7 @@ BlueZ の状態が壊れた場合のみ実行する。**毎回実行するとボ
 cd lpwa
 python3 -m sim                       # 全シナリオ（直線 5 台・格子 9 台・ランダム 20 台・途中停止）
 python3 -m sim --scenario random20 --ttl 5 --seeds 20
+python3 -m sim --router managed_v2 --routers 3   # v2 と、ROUTER 役 3 台
 ```
 
 ---

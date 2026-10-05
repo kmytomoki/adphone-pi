@@ -6,19 +6,19 @@
 #    chmod +x lpwa.sh                              # 初回のみ
 #    ./lpwa.sh status                              # 現在の setting.ini の設定を表示
 #    ./lpwa.sh config --own 1                      # アドレスを設定して E220 に書き込む
-#    ./lpwa.sh bridge                              # BLE-LPWA 平文ブリッジ起動
+#    ./lpwa.sh bridge                              # BLE-LPWA ブリッジ起動（v2 メッシュ）
 #    ./lpwa.sh bridge --own 2 --target 1           # アドレスを上書きしてブリッジ起動
-#    ./lpwa.sh bridge --crypto                     # 暗号化ブリッジ起動（全ピアと鍵交換）
-#    ./lpwa.sh bridge --crypto --peer 2            # 暗号化ブリッジ（ノード2とのみ鍵交換）
-#    ./lpwa.sh mesh                                # 公開鍵暗号メッシュノード起動
-#    ./lpwa.sh mesh --own 2 --ttl 3                # アドレス・TTL を上書きして起動
-#    ./lpwa.sh mesh --own 1 --peer 2               # ノード1として起動、ノード2とのみ鍵交換
-#    ./lpwa.sh mesh --own 1 --peer 2 --peer 3      # 複数ピアと鍵交換
+#    ./lpwa.sh mesh                                # v2 メッシュノード起動（mesh_node.py）
+#    ./lpwa.sh mesh --own 2                        # アドレスを上書きして起動
 #
-#  mesh 対話コマンド (起動後に stdin から入力):
-#    <宛先(10進)> <メッセージ>                      # ユニキャスト暗号化送信
-#    gbcast <メッセージ>                            # グループ鍵 BROADCAST (全員復号可)
-#    bcast <peer(10進)> <メッセージ>                # ペア鍵 BROADCAST (傍受検証デモ用)
+#  v2（既定）: 管理型フラッディング・常に暗号化・鍵は state/ に保存（ROUTING_PLAN.md Phase 3）
+#    setting.ini: hop_limit / role（CLIENT・ROUTER・CLIENT_MUTE）/ node_name / group_key_hex
+#    mesh 対話コマンド: <宛先> <本文> / all <本文> / nodes / forget <addr> / announce / stats
+#
+#  v1（--legacy）: 旧方式。全ノードを同じ方式にそろえること
+#    ./lpwa.sh bridge --legacy --crypto [--peer 2]  # v1 暗号化ブリッジ
+#    ./lpwa.sh mesh --legacy --ttl 3 [--peer 2]     # v1 メッシュノード（node_mesh.py）
+#    v1 mesh 対話コマンド: <宛先> <本文> / gbcast <本文> / bcast <peer> <本文>
 #
 #  グループ鍵設定 (setting.ini):
 #    group_key_hex = <64桁hex>                      # 32バイト AES-256 グループ鍵
@@ -36,11 +36,11 @@
 #  オプション:
 #    --own    ADDR   自ノードアドレス（0〜65534, 例: 1）
 #    --target ADDR   送信先アドレス（0〜65535, 65535=ブロードキャスト）
-#    --ttl    N      アドホック TTL（1〜255, デフォルト: setting.ini の値）
 #    --port   PATH   シリアルポート（デフォルト: /dev/ttyS0）
-#    --crypto        暗号化モードを有効にする（bridge / mesh 共通）
-#    --peer   ADDR   鍵交換する相手アドレス（複数指定可: --peer 2 --peer 3）
-#                    省略時は受信したすべての ANNOUNCE から鍵交換する
+#    --legacy        v1 で動かす（以下は v1 専用）
+#    --ttl    N      [v1] アドホック TTL（1〜255, デフォルト: setting.ini の値）
+#    --crypto        [v1] 暗号化モードを有効にする（bridge / mesh 共通）
+#    --peer   ADDR   [v1] 鍵交換する相手アドレス（複数指定可: --peer 2 --peer 3）
 # =============================================================
 
 set -e
@@ -70,6 +70,7 @@ OWN_ADDRESS=""
 TARGET_ADDRESS_ARG=""
 TTL_ARG=""
 CRYPTO_MODE=""      # --crypto が指定された場合 "1"
+LEGACY=""           # --legacy が指定された場合 "1"（v1 で動かす）
 PEER_ADDRS=()       # --peer で指定されたアドレス（配列）
 
 # ── 色付きログ ───────────────────────────────────────────────
@@ -122,6 +123,8 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"; shift 2 ;;
         --crypto)
             CRYPTO_MODE="1"; shift ;;
+        --legacy)
+            LEGACY="1"; shift ;;
         --peer)
             PEER_ADDRS+=("$2"); shift 2 ;;
         -h|--help)
@@ -278,20 +281,29 @@ case "$SUBCOMMAND" in
         EFF_OWN="${OWN_ADDRESS:-$(ini_get own_address 0)}"
         EFF_TGT="${TARGET_ADDRESS_ARG:-$(ini_get target_address 65535)}"
         EFF_TTL="${TTL_ARG:-$(ini_get ttl 3)}"
-        BRIDGE_ARGS="--self-address $EFF_OWN --target-address $EFF_TGT --ttl $EFF_TTL"
-        [[ -n "$CRYPTO_MODE" ]] && BRIDGE_ARGS="$BRIDGE_ARGS --crypto"
-        for P in "${PEER_ADDRS[@]}"; do
-            BRIDGE_ARGS="$BRIDGE_ARGS --peer $P"
-        done
+        BRIDGE_ARGS="--self-address $EFF_OWN --target-address $EFF_TGT"
+        if [[ -n "$LEGACY" ]]; then
+            BRIDGE_ARGS="$BRIDGE_ARGS --legacy --ttl $EFF_TTL"
+            [[ -n "$CRYPTO_MODE" ]] && BRIDGE_ARGS="$BRIDGE_ARGS --crypto"
+            for P in "${PEER_ADDRS[@]}"; do
+                BRIDGE_ARGS="$BRIDGE_ARGS --peer $P"
+            done
+        elif [[ -n "$CRYPTO_MODE$TTL_ARG" || ${#PEER_ADDRS[@]} -gt 0 ]]; then
+            warn "--crypto / --ttl / --peer は v1（--legacy）専用です。v2 は setting.ini を使い、常に暗号化します"
+        fi
 
         info "ブリッジ起動中... (Ctrl+C で停止)"
         sudo "$PY" -B "$BRIDGE" $BRIDGE_ARGS
         ;;
 
     mesh)
-        echo -e "\n${CYAN}=== 公開鍵暗号メッシュノード ===${NC}"
-        MESH="$SCRIPT_DIR/node_mesh.py"
-        [[ -f "$MESH" ]] || error "node_mesh.py が見つかりません: $MESH"
+        echo -e "\n${CYAN}=== メッシュノード${LEGACY:+ (v1)} ===${NC}"
+        if [[ -n "$LEGACY" ]]; then
+            MESH="$SCRIPT_DIR/node_mesh.py"
+        else
+            MESH="$SCRIPT_DIR/mesh_node.py"
+        fi
+        [[ -f "$MESH" ]] || error "メッシュノードが見つかりません: $MESH"
 
         # venv の python3 を優先使用（cryptography 等が venv に入っているため）
         VENV_PY="$SCRIPT_DIR/.venv/bin/python3"
@@ -331,7 +343,12 @@ case "$SUBCOMMAND" in
         done
 
         info "メッシュノード起動中... (Ctrl+C で停止)"
-        "$PY" -B "$MESH" $MESH_ARGS
+        if [[ -n "$LEGACY" ]]; then
+            "$PY" -B "$MESH" $MESH_ARGS
+        else
+            # v2 は鍵ファイル（state/、パーミッション 600）をブリッジと共有するため root で動かす
+            sudo "$PY" -B "$MESH"
+        fi
         ;;
 
     test)

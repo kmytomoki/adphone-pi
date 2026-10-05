@@ -119,7 +119,7 @@ class Simulator:
         self.now = 0.0
         self.metrics = Metrics()
         rng = random.Random(seed)
-        self.medium = Medium(positions, self.params, random.Random(rng.getrandbits(32)))
+        self.medium = self.make_medium(positions, self.params, rng)
         self._queue: list[tuple[float, int, _Timer, Callable[[], None]]] = []
         self._seq = itertools.count()
         self.nodes = {a: SimNode(self, a, random.Random(rng.getrandbits(32)))
@@ -128,6 +128,17 @@ class Simulator:
             node.router = router_factory(node)
         for node in self.nodes.values():
             node.router.start()
+
+    @staticmethod
+    def make_medium(positions: dict[int, tuple[float, float]], params: RadioParams,
+                    rng: random.Random) -> Medium:
+        return Medium(positions, params, random.Random(rng.getrandbits(32)))
+
+    @classmethod
+    def preview_medium(cls, positions: dict[int, tuple[float, float]], params: RadioParams,
+                       seed: int) -> Medium:
+        """Simulator(seed=seed) が作るのと同じ電波環境（ノードの役割を決める前に使う）。"""
+        return cls.make_medium(positions, params, random.Random(seed))
 
     def schedule(self, at: float, fn: Callable[[], None]) -> _Timer:
         timer = _Timer()

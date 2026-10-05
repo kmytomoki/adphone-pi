@@ -48,6 +48,11 @@ class FloodRouterV1:
         self._seen: deque[tuple[int, int]] = deque(maxlen=seen_max)
         self._seq = ctx.random().getrandbits(16)
 
+    @staticmethod
+    def reach_hops(params: dict) -> int:
+        """何ホップ先まで届くか（v1 の ttl はそのままホップ数）。"""
+        return params.get("ttl", 3)
+
     # ── 送信 ────────────────────────────────────────────────
     def start(self) -> None:
         if self.announce_interval:

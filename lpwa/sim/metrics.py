@@ -19,6 +19,7 @@ class MessageRecord:
     hop_distance: int | None          # 宛先までの最短ホップ数（ユニキャストのみ）
     receivers: dict[int, float] = field(default_factory=dict)   # ノード → 受信時刻
     tx_count: int = 0                 # このメッセージのために送られたパケット数（中継・ACK 含む）
+    airtime: float = 0.0              # そのパケットの電波の占有時間の合計（秒）
 
     @property
     def is_broadcast(self) -> bool:
@@ -42,6 +43,7 @@ class Metrics:
         rec = self.messages.get(meta.key) if meta.key else None
         if rec is not None:
             rec.tx_count += 1
+            rec.airtime += airtime
 
     def on_rx_result(self, reason: str) -> None:
         self.rx_results[reason] += 1
@@ -82,6 +84,8 @@ class Metrics:
             "broadcast_reach": mean(reach),
             "tx_per_unicast": mean([r.tx_count for r in uni]),
             "tx_per_broadcast": mean([r.tx_count for r in bc]),
+            "airtime_per_unicast": mean([r.airtime for r in uni]),
+            "airtime_per_broadcast": mean([r.airtime for r in bc]),
             "latency_p50": pct(latencies, 0.5),
             "latency_p95": pct(latencies, 0.95),
             "tx_by_kind": dict(self.tx_by_kind),

@@ -12,6 +12,7 @@ sim/scenarios.py  ―  トポロジとメッセージの流し方（シナリオ
 """
 from __future__ import annotations
 
+import inspect
 import math
 import random
 from dataclasses import dataclass
@@ -71,7 +72,7 @@ class Scenario:
     mean_interval: float = 10.0       # メッセージ間隔の平均（秒, 指数分布）
     unicast_ratio: float = 0.7
     payload_len: int = 30             # 平文の長さ（日本語約 10 文字）
-    warmup: float = 30.0              # 最初の ANNOUNCE が落ち着くまで待つ
+    warmup: float = 90.0              # 起動時の ANNOUNCE（最大 60 秒に分散）が落ち着くまで待つ
     drain: float = 60.0               # 最後のメッセージの後に待つ時間
     failures: int = 0                 # 途中で停止させるノード数
     fixed_shadowing: bool = True      # False ならシャドウイングなし（line5 で形を崩さない）
@@ -95,8 +96,12 @@ SCENARIOS: dict[str, Scenario] = {s.name: s for s in [
 
 
 def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
-                 router_params: dict | None = None, radio: RadioParams | None = None) -> dict:
-    """シナリオを 1 回実行して集計結果を返す。"""
+                 router_params: dict | None = None, radio: RadioParams | None = None,
+                 routers: int = 0) -> dict:
+    """シナリオを 1 回実行して集計結果を返す。
+
+    routers: 直接届く相手が多い順に、この台数を ROUTER 役にする（役割を持つルーティングのみ）
+    """
     params = radio or RadioParams()
     if not scenario.fixed_shadowing:
         params = RadioParams(**{**params.__dict__, "shadowing_sigma_db": 0.0})
@@ -105,10 +110,16 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
     router_cls = ROUTERS[router]
     rparams = dict(router_params or {})
 
+    sim_seed = rng.getrandbits(32)
+    if routers and "roles" in inspect.signature(router_cls).parameters:
+        medium = Simulator.preview_medium(positions, params, sim_seed)
+        by_degree = sorted(positions, key=lambda a: -len(medium.neighbors(a)))
+        rparams["roles"] = {a: "ROUTER" for a in by_degree[:routers]}
+
     def factory(ctx: NodeContext):
         return router_cls(ctx, **rparams)
 
-    sim = Simulator(positions, factory, params, seed=rng.getrandbits(32))
+    sim = Simulator(positions, factory, params, seed=sim_seed)
     addrs = sorted(positions)
     diameter = _diameter(sim)
 
@@ -126,7 +137,7 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
     for a in doomed:
         sim.schedule(fail_at, sim.nodes[a].kill)
 
-    ttl = rparams.get("ttl", 3)
+    reach = router_cls.reach_hops(rparams)
     for at in send_times:
         src = rng.choice(endpoints)
         if rng.random() < scenario.unicast_ratio:
@@ -137,11 +148,14 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
         sim.schedule(at, lambda src=src, dest=dest, payload=payload: _send(sim, src, dest, payload))
 
     sim.run(end)
-    result = sim.metrics.summary(duration=end, ttl=ttl)
+    result = sim.metrics.summary(duration=end, ttl=reach)
     result.update({
         "scenario": scenario.name, "router": router, "seed": seed,
         "nodes": len(addrs), "diameter": diameter, "duration": end,
-        "router_params": rparams,
+        "router_params": {k: (v.hex() if isinstance(v, bytes) else v) for k, v in rparams.items()
+                          if k != "roles"},
+        "routers": sorted(rparams.get("roles", {})),
+        "router_stats": _router_stats(sim),
     })
     return result
 
@@ -169,3 +183,16 @@ def _diameter(sim: Simulator) -> int | None:
             return None
         worst = max(worst, max(dist.values()))
     return worst
+
+
+def _router_stats(sim: Simulator) -> dict:
+    """ルーターが stats を持っていれば全ノード分を合計する。"""
+    total: dict[str, int] = {}
+    for node in sim.nodes.values():
+        st = getattr(node.router, "stats", None)
+        if st is None:
+            continue
+        for k, v in vars(st).items():
+            if isinstance(v, int):
+                total[k] = total.get(k, 0) + v
+    return total

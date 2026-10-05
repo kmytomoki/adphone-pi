@@ -1,7 +1,7 @@
 [E220-900JP]
 own_address=0  # ノードごとに個別の値を設定すること (0〜65534)
 target_address=65535
-ttl=3
+ttl=3  # [v1] TTL
 baud_rate=9600
 bw=125
 sf=7
@@ -13,9 +13,13 @@ rssi_byte_flag=1
 transmission_method_type=2
 wor_cycle=3000
 encryption_key=0
-announce_wait_sec=10  # node_mesh.py: 起動時に鍵を集める秒数
-announce_interval_sec=300  # ブリッジ: 定期 ANNOUNCE の間隔（秒, 最小 30）
-relay_jitter_ms=500  # 中継前のランダム遅延の上限（ミリ秒）。同時再送による衝突を避ける
+announce_wait_sec=10  # [v1] node_mesh.py: 起動時に鍵を集める秒数
+announce_interval_sec=900  # 定期 ANNOUNCE の間隔（秒）。v1 ブリッジは最小 30
+hop_limit=3  # [v2] 中継回数の上限（3 = 最大 4 ホップ先まで届く。最大 7）
+role=CLIENT  # [v2] CLIENT / ROUTER（見通しのよい固定局。必ず早く中継）/ CLIENT_MUTE（中継しない）
+node_name=  # [v2] ANNOUNCE で名乗る名前（UTF-8 で 16 バイトまで。例: 避難所A）
+state_dir=  # [v2] 鍵ファイルと NodeDB の置き場所（空なら setting.ini と同じ場所の state/）
+relay_jitter_ms=500  # [v1] 中継前のランダム遅延の上限（ミリ秒）。同時再送による衝突を避ける
 group_key_hex=  # 32バイトのAES-256グループ鍵を64桁hexで指定: python3 -c "import os;print(os.urandom(32).hex())"
 group_key_id=0
 packet_gap_sec=0.2

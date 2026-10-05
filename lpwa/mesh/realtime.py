@@ -7,13 +7,16 @@ mesh/realtime.py  ―  Router を実機（E220-900JP）で動かすためのラ�
     while True:
         node.poll()
 
-ブリッジ・node_mesh.py はまだこれを使っていない（Phase 3 で切り替える）。
+RealtimeNode は 1 つのスレッドで回す（Router はスレッドセーフではない）。
+他のスレッド（BLE のコールバックや標準入力）から Router を操作するときは post() を使う。
 """
 from __future__ import annotations
 
 import heapq
 import itertools
+import queue
 import random
+import threading
 import time
 from typing import Callable
 
@@ -64,6 +67,7 @@ class RealtimeNode:
         self._on_deliver = on_deliver
         self._timers: list[tuple[float, int, _Timer, Callable[[], None]]] = []
         self._seq = itertools.count()
+        self._inbox: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         self.router = router_factory(self)
         self.router.start()
 
@@ -87,8 +91,23 @@ class RealtimeNode:
             self._on_deliver(delivery)
 
     # ── ループ ──────────────────────────────────────────────
+    def post(self, fn: Callable[[], None]) -> None:
+        """他のスレッドから、ループのスレッドで fn を実行してもらう。"""
+        self._inbox.put(fn)
+
+    def run_forever(self, stop: threading.Event, max_wait: float = 0.2,
+                    on_error: Callable[[BaseException], None] | None = None) -> None:
+        while not stop.is_set():
+            try:
+                self.poll(max_wait)
+            except Exception as e:   # 1 パケットの異常でループを止めない
+                if on_error is None:
+                    raise
+                on_error(e)
+
     def poll(self, max_wait: float = 0.5) -> None:
-        """期限の来たタイマーを実行し、次のタイマーまで（最大 max_wait 秒）受信を待つ。"""
+        """期限の来たタイマーと post() された処理を実行し、次のタイマーまで（最大 max_wait 秒）受信を待つ。"""
+        self._run_posted()
         self._run_due_timers()
         wait = max_wait
         if self._timers:
@@ -96,7 +115,16 @@ class RealtimeNode:
         pkt = self.port.recv(wait)
         if pkt:
             self.router.on_receive(pkt, self.port.last_rssi)
+        self._run_posted()
         self._run_due_timers()
+
+    def _run_posted(self) -> None:
+        while True:
+            try:
+                fn = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            fn()
 
     def _run_due_timers(self) -> None:
         while self._timers and self._timers[0][0] <= self.now():
