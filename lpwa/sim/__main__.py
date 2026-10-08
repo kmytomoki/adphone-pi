@@ -20,7 +20,7 @@ import sys
 from mesh import ROUTERS
 
 from .radio import RadioParams
-from .scenarios import SCENARIOS, run_scenario
+from .scenarios import DEFAULT_SCENARIOS, SCENARIOS, run_scenario
 
 _AVG_KEYS = [
     "unicast_delivery", "unicast_delivery_within_ttl", "unicast_beyond_ttl",
@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", metavar="PATH", help="seed ごとの結果を JSON で保存")
     args = ap.parse_args(argv)
 
-    names = list(SCENARIOS) if args.scenario == "all" else [args.scenario]
+    names = DEFAULT_SCENARIOS if args.scenario == "all" else [args.scenario]
     radio = RadioParams(sf=args.sf, carrier_sense_dbm=args.lbt)
     if args.router == "flood_v1":
         router_params = {
@@ -130,6 +130,13 @@ def main(argv: list[str] | None = None) -> int:
             _fmt(_avg(results, "max_airtime_per_hour"), "num"),
         ]
         print("  ".join("{:>8}".format(c) for c in row))
+        if _avg(results, "unicast_delivery_repeat") is not None:
+            print("{:>8}  └ 同じ相手との 2 回目以降: 到達 {}  送信 {}  送信/最短ホップ {}（データ+ACK を最短で送れば 2.0）{}".format(
+                "", _fmt(_avg(results, "unicast_delivery_repeat"), "pct"),
+                _fmt(_avg(results, "tx_per_unicast_repeat"), "num"),
+                _fmt(_avg(results, "tx_over_hops_repeat"), "num"),
+                "  停止後の到達 " + _fmt(_avg(results, "unicast_delivery_after_failure"), "pct")
+                if _avg(results, "unicast_delivery_after_failure") is not None else ""))
 
     print()
     print("ユニ到達 = ユニキャストが宛先に届いた割合 / TTL圏内 = 宛先が TTL 以内のホップにある場合の到達率")

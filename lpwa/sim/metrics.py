@@ -20,6 +20,8 @@ class MessageRecord:
     receivers: dict[int, float] = field(default_factory=dict)   # ノード → 受信時刻
     tx_count: int = 0                 # このメッセージのために送られたパケット数（中継・ACK 含む）
     airtime: float = 0.0              # そのパケットの電波の占有時間の合計（秒）
+    repeat: bool = False              # 同じ 2 台の間の 2 回目以降のやり取り
+    after_failure: bool = False       # ノードの停止後に送ったもの
 
     @property
     def is_broadcast(self) -> bool:
@@ -72,8 +74,21 @@ class Metrics:
                 return None
             return xs[min(len(xs) - 1, int(q * len(xs)))]
 
+        repeat = [r for r in uni if r.repeat]
+        repeat_hops = [r for r in repeat if r.hop_distance]
+        after = [r for r in uni if r.after_failure]
+
         return {
             "unicast_count": len(uni),
+            # 同じ 2 台の間の 2 回目以降（経路を学んだ後）
+            "unicast_repeat_count": len(repeat),
+            "unicast_delivery_repeat":
+                sum(1 for r in repeat if r.dest in r.receivers) / len(repeat) if repeat else None,
+            "tx_per_unicast_repeat": mean([r.tx_count for r in repeat]),
+            # 送信数 ÷ 最短ホップ数。データ + ACK を最短経路で 1 回ずつなら 2.0
+            "tx_over_hops_repeat": mean([r.tx_count / r.hop_distance for r in repeat_hops]),
+            "unicast_delivery_after_failure":
+                sum(1 for r in after if r.dest in r.receivers) / len(after) if after else None,
             "unicast_delivery": len(delivered) / len(uni) if uni else None,
             # TTL の圏内にある宛先だけで見た到達率（アルゴリズム自体の性能）
             "unicast_delivery_within_ttl":

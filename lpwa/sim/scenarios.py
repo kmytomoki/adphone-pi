@@ -75,6 +75,8 @@ class Scenario:
     warmup: float = 90.0              # 起動時の ANNOUNCE（最大 60 秒に分散）が落ち着くまで待つ
     drain: float = 60.0               # 最後のメッセージの後に待つ時間
     failures: int = 0                 # 途中で停止させるノード数
+    fail_central: bool = False        # True: 直接届く相手が多い（中継に使われやすい）ノードを止める
+    pairs: int = 0                    # >0: ユニキャストをこの数の決まった 2 台の間でやり取りする
     fixed_shadowing: bool = True      # False ならシャドウイングなし（line5 で形を崩さない）
 
 
@@ -92,7 +94,16 @@ SCENARIOS: dict[str, Scenario] = {s.name: s for s in [
              lambda p, rng: random_connected(20, p.nominal_range_m(), 4.5, p, rng)),
     Scenario("churn20", "random20 で、途中に 3 台が停止する",
              lambda p, rng: random_connected(20, p.nominal_range_m(), 4.5, p, rng), failures=3),
+    Scenario("pairs20", "random20 で、8 組の決まった 2 台が繰り返しやり取りする（経路学習の効果）",
+             lambda p, rng: random_connected(20, p.nominal_range_m(), 4.5, p, rng),
+             pairs=8, unicast_ratio=0.85, messages=80),
+    Scenario("pairs20f", "pairs20 で、途中に中継の要になりやすい 3 台が停止する（経路の切り替え）",
+             lambda p, rng: random_connected(20, p.nominal_range_m(), 4.5, p, rng),
+             pairs=8, unicast_ratio=0.85, messages=80, failures=3, fail_central=True),
 ]}
+
+# 既定（python3 -m sim）で回すシナリオ
+DEFAULT_SCENARIOS = ["line5", "grid9", "random20", "churn20"]
 
 
 def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
@@ -124,8 +135,13 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
     diameter = _diameter(sim)
 
     # 停止させるノード（送受信の端点には選ばない）
-    doomed = rng.sample(addrs, scenario.failures) if scenario.failures else []
+    if scenario.failures and scenario.fail_central:
+        doomed = _central_nodes(sim, scenario.failures)
+    else:
+        doomed = rng.sample(addrs, scenario.failures) if scenario.failures else []
     endpoints = [a for a in addrs if a not in doomed]
+    pairs = _choose_pairs(sim, endpoints, scenario.pairs, rng) if scenario.pairs else []
+    talked: set[frozenset[int]] = set()
 
     t = scenario.warmup
     send_times = []
@@ -139,13 +155,22 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
 
     reach = router_cls.reach_hops(rparams)
     for at in send_times:
-        src = rng.choice(endpoints)
         if rng.random() < scenario.unicast_ratio:
-            dest = rng.choice([a for a in endpoints if a != src])
+            if pairs:
+                src, dest = rng.choice(pairs)
+                if rng.random() < 0.5:
+                    src, dest = dest, src
+            else:
+                src = rng.choice(endpoints)
+                dest = rng.choice([a for a in endpoints if a != src])
+            repeat = frozenset((src, dest)) in talked
+            talked.add(frozenset((src, dest)))
         else:
-            dest = BROADCAST_ADDR
+            src, dest, repeat = rng.choice(endpoints), BROADCAST_ADDR, False
         payload = bytes(rng.getrandbits(8) for _ in range(scenario.payload_len))
-        sim.schedule(at, lambda src=src, dest=dest, payload=payload: _send(sim, src, dest, payload))
+        after = bool(doomed) and at >= fail_at
+        sim.schedule(at, lambda src=src, dest=dest, payload=payload, repeat=repeat, after=after:
+                     _send(sim, src, dest, payload, repeat, after))
 
     sim.run(end)
     result = sim.metrics.summary(duration=end, ttl=reach)
@@ -160,7 +185,8 @@ def run_scenario(scenario: Scenario, router: str = "flood_v1", seed: int = 1,
     return result
 
 
-def _send(sim: Simulator, src: int, dest: int, payload: bytes) -> None:
+def _send(sim: Simulator, src: int, dest: int, payload: bytes,
+          repeat: bool = False, after_failure: bool = False) -> None:
     node = sim.nodes[src]
     if not node.alive:
         return
@@ -172,7 +198,46 @@ def _send(sim: Simulator, src: int, dest: int, payload: bytes) -> None:
         expected = frozenset([dest])
         hop = dist.get(dest)
     key = node.router.send(dest, payload)
-    sim.metrics.on_origin(key, MessageRecord(src, dest, sim.now, expected, hop))
+    sim.metrics.on_origin(key, MessageRecord(src, dest, sim.now, expected, hop,
+                                             repeat=repeat, after_failure=after_failure))
+
+
+def _central_nodes(sim: Simulator, n: int) -> list[int]:
+    """直接届く相手が多い順に、止めても残りがつながったままになるノードを n 台選ぶ。"""
+    chosen: list[int] = []
+    for a in sorted(sim.nodes, key=lambda a: -len(sim.medium.neighbors(a))):
+        if len(chosen) == n:
+            break
+        rest = [b for b in sim.nodes if b not in chosen and b != a]
+        if _connected_subset(sim, rest):
+            chosen.append(a)
+    return chosen
+
+
+def _connected_subset(sim: Simulator, nodes: list[int]) -> bool:
+    members = set(nodes)
+    seen = {nodes[0]}
+    stack = [nodes[0]]
+    while stack:
+        a = stack.pop()
+        for b in sim.medium.neighbors(a):
+            if b in members and b not in seen:
+                seen.add(b)
+                stack.append(b)
+    return seen == members
+
+
+def _choose_pairs(sim: Simulator, endpoints: list[int], n: int,
+                  rng: random.Random) -> list[tuple[int, int]]:
+    """2 ホップ以上離れた 2 台の組を優先して n 組選ぶ（経路学習の効果が見えるように）。"""
+    far, near = [], []
+    for i, a in enumerate(endpoints):
+        dist = sim.hop_distances(a)
+        for b in endpoints[i + 1:]:
+            (far if dist.get(b, 0) >= 2 else near).append((a, b))
+    rng.shuffle(far)
+    rng.shuffle(near)
+    return (far + near)[:n]
 
 
 def _diameter(sim: Simulator) -> int | None:

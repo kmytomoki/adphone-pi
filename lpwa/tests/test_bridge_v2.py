@@ -100,6 +100,19 @@ class MeshConfigTest(unittest.TestCase):
             mc = load_mesh_config(cfg, os.path.join(d, "setting.ini"))
             self.assertEqual(mc.state_dir, os.path.join(d, "state"))
 
+    def test_routing_choice(self):
+        from mesh.reliable import ReliableRouter
+        from mesh.router import ManagedFloodRouter
+        from test_mesh_v2 import _Ctx
+        with tempfile.TemporaryDirectory() as d:
+            for routing, cls in (("routed", ReliableRouter), ("flood", ManagedFloodRouter)):
+                mc = load_mesh_config(_cfg(os.path.join(d, routing), routing=routing),
+                                      os.path.join(d, "setting.ini"))
+                factory, _, _ = make_router_factory(mc)
+                self.assertIs(type(factory(_Ctx(2))), cls)
+            with self.assertRaises(ValueError):
+                load_mesh_config(_cfg(d, routing="aodv"), os.path.join(d, "setting.ini"))
+
     def test_bad_role(self):
         with tempfile.TemporaryDirectory() as d, self.assertRaises(ValueError):
             load_mesh_config(_cfg(d, role="KING"), os.path.join(d, "setting.ini"))

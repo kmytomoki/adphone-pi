@@ -566,7 +566,13 @@ def _mesh_on_deliver(d) -> None:
 
 
 def _mesh_on_event(event: str, info: dict) -> None:
-    if event == "key_conflict":
+    # delivered / send_failed は Phase 5 で BLE の配送状態（STATUS）として通知する
+    if event == "delivered":
+        logger.info("[MESH] 届いた → 0x%04X msg_id=%08X（%d ホップ, %d 回目）",
+                    info["dest"], info["msg_id"], info["hops"], info["attempts"])
+    elif event == "send_failed":
+        logger.warning("[MESH] 届かず → 0x%04X msg_id=%08X", info["dest"], info["msg_id"])
+    elif event == "key_conflict":
         logger.warning("[MESH] 0x%04X が登録済みと違う鍵で名乗っています（指紋 %s）。"
                        "ノードを入れ替えたなら python3 -m mesh.nodedb <nodedb.json> forget %d",
                        info["addr"], info["fingerprint"], info["addr"])
@@ -586,8 +592,8 @@ def _start_mesh() -> threading.Thread:
     mc.address = lora_e220_b.SELF_ADDRESS          # --self-address を反映
     factory, identity, _ = make_router_factory(mc, on_event=_mesh_on_event)
     _mesh_node = RealtimeNode(E220Port(), factory, address=mc.address, on_deliver=_mesh_on_deliver)
-    logger.info("[INIT] v2 メッシュ  self=0x%04X  役割=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
-                mc.address, mc.role, mc.hop_limit, identity.fingerprint,
+    logger.info("[INIT] v2 メッシュ  self=0x%04X  役割=%s  経路=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
+                mc.address, mc.role, mc.routing, mc.hop_limit, identity.fingerprint,
                 "あり" if mc.group_key else "なし")
     if lora_e220_b.TARGET_ADDRESS == 0xFFFF and mc.group_key is None:
         logger.error("[INIT] 送信先がブロードキャストですが group_key_hex が未設定です。"

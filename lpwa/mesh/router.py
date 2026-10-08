@@ -37,6 +37,7 @@ _E220_OVERHEAD = 7 + 3     # 外層フレーム + Fixed Mode ヘッダ
 class _PendingRelay:
     pkt: P.Packet
     timer: TimerHandle
+    q: int = P.LINK_Q_UNKNOWN     # このパケットを受けたときのリンク品質
     dups: int = 0
 
 
@@ -158,8 +159,8 @@ class ManagedFloodRouter:
 
     def _originate(self, base: P.Packet, body: bytes, key: MessageKey, kind: str = "origin") -> None:
         for pkt in P.fragment(base, body):
-            self._mark_seen(pkt.dedup_key)
-            self.ctx.transmit(pkt.encode(), TxMeta(kind, key))
+            self._mark_seen(self._dkey(pkt))
+            self._tx(pkt, TxMeta(kind, key))
 
     def _next_msg_id(self) -> int:
         self._counter = (self._counter + 1) & 0xFFFF
@@ -201,15 +202,21 @@ class ManagedFloodRouter:
         except P.PacketError:
             self.stats.bad_packet += 1
             return
+        self._on_flood(pkt, raw, rssi)
+
+    def _on_flood(self, pkt: P.Packet, raw: bytes, rssi: int | None) -> None:
         now = self.ctx.now()
-        k = pkt.dedup_key
+        k = self._dkey(pkt)
         if self._is_seen(k, now):
             self._on_duplicate(pkt)
+            if pkt.src != self.addr:
+                self._on_copy(pkt, rssi)
             return
         self._mark_seen(k)
         if pkt.src == self.addr:
             return
         self.nodedb.heard(pkt.src, pkt.last_hop, pkt.hops_taken + 1, rssi, now)
+        self._on_copy(pkt, rssi)
 
         if pkt.type == P.TYPE_ANNOUNCE:
             ok = self._on_announce(pkt)
@@ -227,9 +234,10 @@ class ManagedFloodRouter:
     def _maybe_relay(self, pkt: P.Packet, raw_len: int, rssi: int | None) -> None:
         if pkt.hop_limit <= 0 or self.role == "CLIENT_MUTE":
             return
-        k = pkt.dedup_key
-        delay = self._relay_delay(raw_len + 2, rssi)
-        self._relays[k] = _PendingRelay(pkt, self.ctx.call_later(delay, lambda: self._do_relay(k)))
+        k = self._dkey(pkt)
+        delay = self._relay_delay(raw_len + P.PATH_ENTRY, rssi)
+        self._relays[k] = _PendingRelay(pkt, self.ctx.call_later(delay, lambda: self._do_relay(k)),
+                                        self.link_quality(rssi))
 
     def _my_neighbors(self) -> set[int]:
         """最近聞こえた隣ノード（待ち窓の大きさを決めるのに使う）。
@@ -271,23 +279,41 @@ class ManagedFloodRouter:
 
     def _on_duplicate(self, pkt: P.Packet) -> None:
         self.stats.duplicates += 1
-        pr = self._relays.get(pkt.dedup_key)
+        k = self._dkey(pkt)
+        pr = self._relays.get(k)
         if pr is None or self.role == "ROUTER":
             return
         pr.dups += 1
         if pr.dups >= self.cancel_threshold:
             pr.timer.cancel()
-            del self._relays[pkt.dedup_key]
+            del self._relays[k]
             self.stats.relay_cancelled += 1
 
     def _do_relay(self, k: tuple[int, int, int]) -> None:
         pr = self._relays.pop(k, None)
         if pr is None:
             return
-        out = pr.pkt.relayed_by(self.addr)
+        out = pr.pkt.relayed_by(self.addr, pr.q)
         kind = "announce" if out.type == P.TYPE_ANNOUNCE else "relay"
-        self.ctx.transmit(out.encode(), TxMeta(kind, MessageKey(out.src, out.msg_id)))
+        self._tx(out, TxMeta(kind, MessageKey(out.src, out.msg_id)))
         self.stats.relayed += 1
+
+    # ── フック（Phase 4 の ReliableRouter が上書きする） ────
+    def _dkey(self, pkt: P.Packet) -> tuple:
+        """重複判定のキー。"""
+        return pkt.dedup_key
+
+    def _on_copy(self, pkt: P.Packet, rssi: int | None) -> None:
+        """フラッディングのパケットを受けたとき（重複のコピーも含む。他ノード発のみ）。"""
+
+    def link_quality(self, rssi: int | None) -> int:
+        """受信 RSSI → リンク品質（感度からの余裕 dB, 0〜254。不明は 255）。"""
+        if rssi is None:
+            return P.LINK_Q_UNKNOWN
+        return int(min(254, max(0, round(rssi - self.sensitivity))))
+
+    def _tx(self, pkt: P.Packet, meta: TxMeta) -> None:
+        self.ctx.transmit(pkt.encode(), meta)
 
     # ── 種類ごとの処理（False を返したら中継しない） ─────────
     def _on_announce(self, pkt: P.Packet) -> bool:

@@ -40,11 +40,13 @@ class PacketTest(unittest.TestCase):
     def test_roundtrip(self):
         pkt = self._pkt(flags=P.FLAG_WANT_ACK, path=(5, 6))
         self.assertEqual(P.Packet.decode(pkt.encode()), pkt)
-        self.assertEqual(len(pkt.encode()), P.HEADER_SIZE + 4 + 5)
+        self.assertEqual(len(pkt.encode()), P.HEADER_SIZE + 2 * P.PATH_ENTRY + 5)
 
     def test_relay_decrements_and_appends_path(self):
-        out = self._pkt().relayed_by(7).relayed_by(8)
+        out = self._pkt().relayed_by(7, 12).relayed_by(8, 3)
         self.assertEqual((out.hop_limit, out.hop_start, out.path), (1, 3, (7, 8)))
+        self.assertEqual(out.link_q, (12, 3))
+        self.assertEqual(P.Packet.decode(out.encode()).link_q, (12, 3))
         self.assertEqual(out.hops_taken, 2)
         self.assertEqual(out.last_hop, 8)
 

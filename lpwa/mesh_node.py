@@ -13,7 +13,8 @@ node_mesh.py（v1）の後継。設定は setting.ini（mesh/config.py 参照）
     nodes             知っているノードの一覧（指紋つき）
     forget <addr>     そのノードの鍵を忘れる（入れ替えたノードを受け入れるとき）
     announce          今すぐ ANNOUNCE を送る
-    stats             中継・取りやめ・鍵の要求などの回数
+    stats             中継・取りやめ・鍵の要求・ACK・再送などの回数
+    route <addr>      その相手への経路（中継ノード列）。routing=routed のとき
     quit
 """
 from __future__ import annotations
@@ -37,6 +38,12 @@ def _on_event(event: str, info: dict) -> None:
         log.warning("[鍵の不一致] 0x%04X が登録済みと違う鍵で名乗っています（指紋 %s）。"
                     "ノードを入れ替えたなら 'forget %d' で受け入れます",
                     info["addr"], info["fingerprint"], info["addr"])
+    elif event == "delivered":
+        log.info("[届いた] → 0x%04X msg_id=%08X（%d ホップ, %d 回目で）",
+                 info["dest"], info["msg_id"], info["hops"], info["attempts"])
+    elif event == "send_failed":
+        log.warning("[届かず] → 0x%04X msg_id=%08X（再送しても ACK が返りませんでした）",
+                    info["dest"], info["msg_id"])
     elif event == "peer":
         log.info("[PEER ] 0x%04X %s %s（指紋 %s）", info["addr"], info["role"], info["name"],
                  info["fingerprint"])
@@ -55,8 +62,8 @@ def main() -> int:
     factory, identity, nodedb = make_router_factory(mc, on_event=_on_event)
     node = RealtimeNode(E220Port(), factory, address=mc.address, on_deliver=_on_deliver)
     router = node.router
-    log.info("自ノード 0x%04X  役割=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
-             mc.address, mc.role, mc.hop_limit, identity.fingerprint,
+    log.info("自ノード 0x%04X  役割=%s  経路=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
+             mc.address, mc.role, mc.routing, mc.hop_limit, identity.fingerprint,
              "あり" if mc.group_key else "なし")
 
     stop = threading.Event()
@@ -95,6 +102,18 @@ def main() -> int:
                 continue
             node.post(lambda a=addr: print("  削除しました" if nodedb.forget(a)
                                            else "  登録されていません"))
+        elif cmd == "route":
+            try:
+                addr = int(rest, 0)
+            except ValueError:
+                print("  使い方: route <addr>")
+                continue
+            if hasattr(router, "route_for"):
+                path = router.route_for(addr)
+                print("  " + ("経路なし（フラッディングで送ります）" if path is None else
+                              " → ".join("0x{:04X}".format(a) for a in (mc.address, *path, addr))))
+            else:
+                print("  routing=flood では経路を使いません")
         elif cmd == "announce":
             node.post(router.announce)
         elif cmd == "stats":
