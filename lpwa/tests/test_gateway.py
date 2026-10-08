@@ -67,8 +67,13 @@ class BleProtoTest(unittest.TestCase):
 #  受信箱・送信箱
 # ════════════════════════════════════════════════════════════
 class StoreTest(unittest.TestCase):
+    def _store(self, **kw) -> Store:
+        s = Store(**kw)
+        self.addCleanup(s.close)
+        return s
+
     def test_inbox_dedupe_and_since(self):
-        s = Store()
+        s = self._store()
         self.assertEqual(s.add_inbox(1, 2, 100, b"a", 0), 1)
         self.assertIsNone(s.add_inbox(1, 2, 100, b"a", 1), "同じメッセージは 1 回だけ")
         s.add_inbox(1, 2, 101, b"b", 2)
@@ -78,14 +83,14 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(s.last_seq(), 3)
 
     def test_purge(self):
-        s = Store(hold_sec=100, max_inbox=2)
+        s = self._store(hold_sec=100, max_inbox=2)
         for i in range(4):
             s.add_inbox(1, 2, i, b"x", 50 + i)
         s.purge(152)              # 50, 51 は保持期間切れ。残りも上限 2 件
         self.assertEqual([i.seq for i in s.inbox_since(0)], [3, 4])
 
     def test_outbox_due_expired_and_recover(self):
-        s = Store(hold_sec=1000)
+        s = self._store(hold_sec=1000)
         a = s.add_outbox(b"c", 1, 5, b"a", 0)
         s.update_outbox(a, 0, state=B.ST_WAITING, next_try_at=100)
         self.assertEqual(s.outbox_due(50), [])
@@ -141,7 +146,9 @@ class GatewayTest(unittest.TestCase):
         self.sim = Simulator(pos, factory, p, seed=7)
         for a, node in self.sim.nodes.items():
             phone = _Phone(stream=a, client_id=bytes([a]) * 8)
-            gw = MeshGateway(node, node.router, Store(), phone.on_notify,
+            store = Store()
+            self.addCleanup(store.close)
+            gw = MeshGateway(node, node.router, store, phone.on_notify,
                              info={"name": "node{}".format(a)}, retry_base=60.0,
                              wall=lambda: self.sim.now)
             node.deliver = gw.on_deliver
