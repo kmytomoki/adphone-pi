@@ -1,5 +1,6 @@
-dbus-python>=1.2.0
+# dbus-python は旧実装（adphone_ble_server.py など）だけが使う。ビルドに libdbus-1-dev が要るので入れない
 pyserial>=3.5
+cryptography>=41
 hexdump>=3.3
 
 # BLE Peripheral server (BlueZ/DBus backend on Raspberry Pi OS)

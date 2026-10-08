@@ -1,6 +1,9 @@
 [E220-900JP]
-own_address=0  # ノードごとに個別の値を設定すること (0〜65534)
+# コメントは必ず独立した行に書くこと（値の後ろに書くと lpwa.sh と E220 の設定ツールが値として読んでしまう）
+# ノードごとに個別の値を設定すること (0〜65534)
+own_address=0
 target_address=65535
+# [v1] TTL
 ttl=3
 baud_rate=9600
 bw=125
@@ -13,8 +16,26 @@ rssi_byte_flag=1
 transmission_method_type=2
 wor_cycle=3000
 encryption_key=0
+# [v1] node_mesh.py: 起動時に鍵を集める秒数
 announce_wait_sec=10
-group_key_hex=  # 32バイトのAES-256グループ鍵を64桁hexで指定: python3 -c "import os;print(os.urandom(32).hex())"
+# 定期 ANNOUNCE の間隔（秒）。v1 ブリッジは最小 30
+announce_interval_sec=900
+# [v2] 中継回数の上限（3 = 最大 4 ホップ先まで届く。最大 7）
+hop_limit=3
+# [v2] CLIENT / ROUTER（見通しのよい固定局。必ず早く中継）/ CLIENT_MUTE（中継しない）
+role=CLIENT
+# [v2] ANNOUNCE で名乗る名前（UTF-8 で 16 バイトまで。例: 避難所A）
+node_name=
+# [v2] 鍵ファイルと NodeDB の置き場所（空なら setting.ini と同じ場所の state/）
+state_dir=
+# [v2] routed（ACK・経路学習。到達率と配送確認を優先）/ flood（管理型フラッディングのみ。送信数を優先）
+routing=routed
+# [v2] 1 時間の送信時間の上限（秒）。仮の値: E220-900JP の設定と ARIB の区分を確認して決めること
+airtime_budget_sec=360
+# [v1] 中継前のランダム遅延の上限（ミリ秒）。同時再送による衝突を避ける
+relay_jitter_ms=500
+# 32バイトのAES-256グループ鍵を64桁hexで指定: python3 -c "import os;print(os.urandom(32).hex())"
+group_key_hex=
 group_key_id=0
 packet_gap_sec=0.2
 transport_frame_enabled=1

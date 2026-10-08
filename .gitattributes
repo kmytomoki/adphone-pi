@@ -1,0 +1,2 @@
+# シェルスクリプトは常に LF（Windows で取り出しても Raspberry Pi の bash で動くように）
+*.sh text eol=lf

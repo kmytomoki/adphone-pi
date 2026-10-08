@@ -12,6 +12,7 @@ adhoc.py  ―  TTL ベース軽量アドホック通信ヘルパー
 
     src_addr : 送信元ノードアドレス (uint16)
     msg_id   : ノードごとの送信連番 (uint16, 0〜65535 でラップ)
+               起動ごとに乱数から始める（再起動直後のパケットが重複扱いされないように）
     ttl      : 残りホップ数 (uint8, デフォルト 3)
     payload  : データ本体
 
@@ -37,6 +38,7 @@ adhoc.py  ―  TTL ベース軽量アドホック通信ヘルパー
 
 import configparser
 import os
+import random
 import struct
 from collections import deque
 
@@ -46,8 +48,8 @@ _CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config_code', 'setting.i
 
 def _load_ttl() -> int:
     """setting.ini の ttl フィールドを読み込む。未設定・不正値は 3 を返す。1〜255 にクランプ。"""
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_PATH)
+    cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    cfg.read(_CONFIG_PATH, encoding="utf-8")
     try:
         val = int(cfg.get('E220-900JP', 'ttl', fallback='3'))
         return max(1, min(val, 255))
@@ -63,7 +65,9 @@ _SEEN_MAXLEN  = 64  # 重複検知キャッシュの最大保持件数
 
 # ── モジュールレベル状態 ──────────────────────────────────────
 _seen: deque[tuple[int, int]] = deque(maxlen=_SEEN_MAXLEN)
-_seq: int = 0  # 送信連番
+# 送信連番。起動ごとに乱数から始める。0 から始めると、再起動前の (src, msg_id) が
+# 隣接ノードの seen キャッシュに残っている間、新しいパケットが重複として捨てられる。
+_seq: int = random.getrandbits(16)
 
 
 def encode(payload: bytes, src_addr: int, ttl: int = DEFAULT_TTL) -> bytes:

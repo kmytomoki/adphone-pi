@@ -20,6 +20,9 @@ Thumbs.db
 # 実機ごとに異なる設定（サンプルは setting.ini.example を参照）
 **/setting.ini
 
+# 実機ごとの鍵と NodeDB（秘密鍵を含む）
+**/config_code/state/
+
 # 旧作業コピー（lpwa/ が最新版）
 work3/
 

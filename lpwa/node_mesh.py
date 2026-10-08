@@ -38,8 +38,6 @@ setting.ini 設定例:
 """
 
 import argparse
-import configparser
-import os
 import random
 import select
 import struct
@@ -51,19 +49,18 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
-from lora_e220_b import lora_send, lora_recv
+from lora_e220_b import lora_send, lora_recv, CONFIG_PATH, RELAY_JITTER_SEC, load_config_parser
 import adhoc_crypto as crypto
 
 # ─────────────────────────────────────────────────────────────
 #  設定読み込み
 # ─────────────────────────────────────────────────────────────
 
-_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config_code", "setting.ini")
+_CONFIG_PATH = CONFIG_PATH   # lora_e220_b と同じ setting.ini を使う
 
 
 def _load_config() -> tuple[int, int, int]:
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_PATH)
+    cfg = load_config_parser(_CONFIG_PATH)
     sec = "E220-900JP"
     own_addr  = int(cfg.get(sec, "own_address",       fallback="1"))
     ttl       = int(cfg.get(sec, "ttl",               fallback="3"))
@@ -77,8 +74,7 @@ def load_group_key(config_path: str = _CONFIG_PATH) -> tuple[bytes, int] | None:
     未設定なら None を返す。形式不正時は ValueError を送出する。
     将来 bridge 側でも同じ関数を import して使えるよう独立させてある。
     """
-    cfg = configparser.ConfigParser()
-    cfg.read(config_path)
+    cfg = load_config_parser(config_path)
     sec = "E220-900JP"
     hex_str = cfg.get(sec, "group_key_hex", fallback="").strip()
     if not hex_str:
@@ -155,6 +151,17 @@ def _respect_announce_backoff() -> None:
     remain = _announce_backoff_until - time.time()
     if remain > 0:
         time.sleep(remain)
+
+
+def _send_relay(relay: bytes) -> None:
+    """中継パケットを 0〜relay_jitter_ms のランダム遅延を置いて送る。
+
+    近くのノードが同時に再送して衝突するのを避けるため。
+    待っている間に届いたパケットは lora_e220_b の受信バッファに溜まり、次の受信で読み出される。
+    """
+    time.sleep(random.uniform(0, RELAY_JITTER_SEC))
+    _respect_announce_backoff()
+    lora_send(relay)
 
 
 def _print_drop_stats() -> None:
@@ -266,8 +273,7 @@ def _handle_packet(raw: bytes, ed_priv, dh_priv,
         # ブロードキャストを全ノードへ中継
         relay = crypto.make_relay(raw)
         if relay:
-            time.sleep(random.uniform(_ANNOUNCE_BACKOFF_MIN, _ANNOUNCE_BACKOFF_MAX))
-            lora_send(relay)
+            _send_relay(relay)
             print("[RELAY-ANN] src={} ttl: {} → {}".format(
                 _addr(src), ttl, ttl - 1
             ))
@@ -322,9 +328,7 @@ def _handle_packet(raw: bytes, ed_priv, dh_priv,
 
         relay = crypto.make_relay(raw)
         if relay:
-            time.sleep(0.05)
-            _respect_announce_backoff()
-            lora_send(relay)
+            _send_relay(relay)
             print("[RELAY-GBCAST] src={} ttl: {} → {}".format(
                 _addr(src), ttl, ttl - 1))
         return
@@ -371,9 +375,7 @@ def _handle_packet(raw: bytes, ed_priv, dh_priv,
             if dest == crypto.BROADCAST_ADDR:
                 relay = crypto.make_relay(raw)
                 if relay:
-                    time.sleep(0.05)
-                    _respect_announce_backoff()
-                    lora_send(relay)
+                    _send_relay(relay)
                     print("[RELAY-BCAST] src={} ttl: {} → {}".format(
                         _addr(src), ttl, ttl - 1))
 
@@ -394,9 +396,7 @@ def _handle_packet(raw: bytes, ed_priv, dh_priv,
 
             relay = crypto.make_relay(raw)
             if relay:
-                time.sleep(0.05)
-                _respect_announce_backoff()
-                lora_send(relay)
+                _send_relay(relay)
                 print("        → 転送完了 (ttl: {} → {})".format(ttl, ttl - 1))
             else:
                 print("        → TTL=0, 廃棄")
