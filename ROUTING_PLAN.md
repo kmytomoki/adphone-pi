@@ -361,11 +361,36 @@ pairs20 で 5.8、pairs20f で 5.7。
 
 ### Phase 5: 蓄積転送 + BLE プロトコル v2（目安 2〜3 週間）
 
-- [ ] Pi に蓄積キュー（SQLite、保持 24 時間・上限件数つき）
-- [ ] BLE フレーム v2（5 章）をブリッジに実装
-- [ ] `ReactNative/my-app/lib/ble2.ts` のスタブを本実装に戻し、v2 フレームに対応する。配送状態をチャット UI に表示する
+- [x] Pi に蓄積キュー（SQLite、保持 24 時間・上限件数つき）
+- [x] BLE フレーム v2（5 章）をブリッジに実装
+- [x] `ReactNative/my-app/lib/ble2.ts` のスタブを本実装に戻し、v2 フレームに対応する。配送状態をチャット UI に表示する
+  （アプリはブランチ `feature/ble-v2`。**実機での BLE 接続はまだ試していない**）
 - [ ] 実機の屋外試験（避難所間の距離を想定した 3〜5 台）
 - [ ] 実機で測った 1 リンクの成功率・RSSI をシミュレータに反映し、flood / routed を再評価する（Phase 4 の宿題）
+
+実装メモ（2026-10-08）:
+- Pi 側: `mesh/bleproto.py`（BLE v2 の形式）・`mesh/store.py`（受信箱・送信箱, SQLite）・`mesh/gateway.py`（BLE ↔ メッシュ）。
+  ブリッジは v2 のとき、BLE の書き込みをメッシュのスレッドのゲートウェイに渡し、通知を 20ms 間隔で書き出すだけ
+- 5 章からの変更・追加:
+  - BLE の 1 パケット（チャンク）に 3 バイトの見出し（0xAD・stream・分割番号）を付けた。0xAD は UTF-8 の先頭に
+    現れないので、旧アプリの生テキストと区別できる。stream は複数のスマホの書き込みを混ぜないため。1 パケット最大 180B
+  - kind は MSG・STATUS・HELLO・INFO・NODES_REQ・NODES。HISTORY_REQ / HISTORY は HELLO と MSG にまとめた
+  - **スマホごとの未配信キューは持たない**。受信箱に Pi ごとの連番を振り、スマホが HELLO で「最後に受け取った連番」を
+    伝えると、それより新しいもの（最大 50 件）を送る。スマホを入れ替えても、何台つながっても Pi 側の状態が増えない
+  - 配送状態: 受付（鍵待ちを含む）→ 送信済み → 中継された（全体宛て。隣の中継を聞いた）／届いた（ACK）→
+    再送待ち → 届かず（24 時間で期限切れ）。HELLO のたびに、そのスマホが送ったものの最新の状態を送り直す
+  - 届かなかったもの（ルーターの再送をすべて使い切ったもの）は送信箱で 5 分・10 分・20 分…（最大 1 時間）おきに送り直す。
+    Pi が再起動したら、ACK 待ちだったものは送り直しに回す
+  - 時刻: 受信箱・送信箱は時計（`time.time`）で記録する（再起動をまたぐため）。タイマーは単調時計
+- アプリ側（`ReactNative/my-app`, ブランチ `feature/ble-v2`）:
+  - `lib/bleProtocol.ts`（形式。Python 版と相互に組み立てられることを確認済み）・`lib/ble2.ts` を
+    `react-native-ble-plx` で作り直した（元の実装は依存から外れた `react-native-ble-manager` を使っていた）
+  - LPWA チャットの自分のメッセージの下に配送状態を表示（`components/DeliveryStatusLabel.tsx`）
+  - `BleToFeedBridge` が受信 200 件を超えると新着を取りこぼす不具合を直した（1 件ずつ受け取る購読に変更）
+  - 設定の BLE テスト画面: 宛先の指定（以前は本文に `--target` を書く方式で Pi 側は解釈していなかった）、
+    配送状態・中継局の情報・ノード一覧
+- 実機で確かめること: BLE の接続と MTU（Android は 247 を要求、iOS は自動）、通知の取りこぼし（20ms 間隔で足りるか）、
+  bless で複数のスマホに同時に通知したときの挙動
 
 ### Phase 6 以降（候補）
 
@@ -393,7 +418,9 @@ Raspberry/
       identity.py             #   [Phase 3] 永続鍵、暗号、ANNOUNCE の署名と検証
       config.py               #   [Phase 3] setting.ini からルーターを組み立てる
       airtime.py              #   [Phase 3] LoRa の送信時間と感度
-      store.py                #   蓄積転送
+      store.py                #   [Phase 5] 蓄積転送（受信箱・送信箱, SQLite）
+      bleproto.py             #   [Phase 5] BLE プロトコル v2
+      gateway.py              #   [Phase 5] BLE ↔ メッシュ（配送状態・履歴・送り直し）
     sim/                      # [Phase 2] 離散イベントシミュレータ（python3 -m sim）
       radio.py                #   無線モデル（送信時間・減衰・衝突・半二重）
       engine.py               #   イベントループ、仮想ノード

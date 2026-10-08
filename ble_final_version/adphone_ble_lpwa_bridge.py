@@ -17,6 +17,13 @@ adphone_ble_lpwa_bridge.py — Raspberry Pi 4 BLEサーバー
     - TX_CHAR_UUID への Write を受信 → 全接続クライアントへ RX_CHAR_UUID でエコーバック
     - 接続・切断のたびに META_CHAR_UUID へ接続台数(1バイト)を Notify
 
+BLE（v2）:
+    スマホとは BLE プロトコル v2（lpwa/mesh/bleproto.py）でやり取りする。処理は lpwa/mesh/gateway.py。
+    受信したメッセージは受信箱（state/store.db）に残し、再接続したスマホが取りこぼしを回収できる。
+    スマホが送ったメッセージには配送状態（受付・送信済み・中継された・届いた・再送待ち・届かず）を返し、
+    届かなかったものは送信箱に残して後で送り直す（蓄積転送）。
+    旧アプリの UTF-8 の生テキストも受け付ける（送信先 TARGET_ADDRESS へ送るだけ。エコーはしない）。
+
 LPWA:
     既定は v2（lpwa/mesh/ の管理型フラッディング。ROUTING_PLAN.md Phase 3）。
     設定は setting.ini（hop_limit / role / node_name / group_key_hex など。mesh/config.py 参照）。
@@ -119,6 +126,9 @@ _pending_crypto: "list[tuple[float, int, bytes]]" = []  # (受付時刻, 宛先,
 # ─── v2（mesh/）用 ──────────────────────────────────────────────────────────────
 _LEGACY: bool = False                            # --legacy で True（v1 で動かす）
 _mesh_node = None                                # mesh.realtime.RealtimeNode
+_gateway = None                                  # mesh.gateway.MeshGateway
+_ble_out: asyncio.Queue | None = None            # スマホへ通知するチャンク（v2）
+_BLE_NOTIFY_GAP_SEC = 0.02                       # 通知の間隔（スマホ側の取りこぼしを防ぐ）
 _mesh_stop = threading.Event()
 
 _PENDING_MAX = 32               # 鍵待ちで保留するメッセージの上限
@@ -222,8 +232,14 @@ def write_request(characteristic: Any, value: Any, **kwargs: Any) -> None:
     if uuid != TX_CHAR_UUID.lower():
         return
 
-    # バイト列 → テキスト
-    raw: bytes = bytes(value) if not isinstance(value, (bytes, bytearray)) else value
+    raw: bytes = bytes(value) if not isinstance(value, (bytes, bytearray)) else bytes(value)
+
+    # ── v2: メッシュのスレッドのゲートウェイに渡す（フレームの組み立て・送信・配送状態） ──
+    if _gateway is not None:
+        _mesh_node.post(lambda: _gateway.on_ble_write(raw))
+        return
+
+    # バイト列 → テキスト（以下は v1 / --legacy）
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -244,12 +260,6 @@ def write_request(characteristic: Any, value: Any, **kwargs: Any) -> None:
     echo_char.value = bytearray(text.encode("utf-8"))
     server.update_value(SERVICE_UUID, RX_CHAR_UUID)
     logger.info("[ECHO] → 全 %d 台へ送信: %s", _notified_count, text)
-
-    # ── v2: メッシュのスレッドに送信を頼む ──────────────────────────────────
-    if _mesh_node is not None:
-        dest = lora_e220_b.TARGET_ADDRESS
-        _mesh_node.post(lambda: _mesh_send(dest, raw))
-        return
 
     # ── LPWA 送信キューへ追加 ────────────────────────────────────────────────
     if _lpwa_send_queue is not None and _loop is not None:
@@ -545,28 +555,36 @@ def _log_ciphertext_preview(raw: bytes, src: int, dest: int, mid: int) -> None:
 
 
 # ─── v2（mesh/）────────────────────────────────────────────────────────────────
-def _mesh_send(dest: int, raw: bytes) -> None:
-    """メッシュのスレッドで呼ばれる。"""
-    from mesh import packet as P
-    try:
-        key = _mesh_node.router.send(dest, raw)
-        logger.info("[MESH TX] → %s msg_id=%08X %d bytes",
-                    "全体" if dest == P.BROADCAST_ADDR else "0x{:04X}".format(dest),
-                    key.msg_id, len(raw))
-    except (ValueError, P.PacketError) as e:
-        logger.error("[MESH TX] 送れません: %s", e)
-
-
 def _mesh_on_deliver(d) -> None:
-    """メッシュのスレッドで呼ばれる。BLE への通知はイベントループに渡す。"""
+    """メッシュのスレッドで呼ばれる。"""
     text = d.payload.decode("utf-8", errors="replace")
-    logger.info("[MESH RX] 0x%04X（%s ホップ）: %s", d.src, d.hops, text)
-    if _loop is not None:
-        _loop.call_soon_threadsafe(_notify_ble_rx, text)
+    logger.info("[MESH RX] 0x%04X（%s ホップ）: %s", d.src, d.hops, text[:80])
+    if _gateway is not None:
+        _gateway.on_deliver(d)
+
+
+def _ble_notify_from_mesh(chunk: bytes) -> None:
+    """メッシュのスレッドから呼ばれる。書き出しはイベントループの _ble_notifier が行う。"""
+    if _loop is not None and _ble_out is not None:
+        _loop.call_soon_threadsafe(_ble_out.put_nowait, chunk)
+
+
+async def _ble_notifier() -> None:
+    """スマホへの通知を 1 チャンクずつ、間をあけて書き出す。"""
+    while True:
+        chunk = await _ble_out.get()
+        if server is not None:
+            rx_char = server.get_characteristic(RX_CHAR_UUID)
+            if rx_char is not None:
+                rx_char.value = bytearray(chunk)
+                server.update_value(SERVICE_UUID, RX_CHAR_UUID)
+        await asyncio.sleep(_BLE_NOTIFY_GAP_SEC)
 
 
 def _mesh_on_event(event: str, info: dict) -> None:
-    # delivered / send_failed は Phase 5 で BLE の配送状態（STATUS）として通知する
+    """メッシュのスレッドで呼ばれる。ログに出し、ゲートウェイ（配送状態）に渡す。"""
+    if _gateway is not None:
+        _gateway.on_event(event, info)
     if event == "delivered":
         logger.info("[MESH] 届いた → 0x%04X msg_id=%08X（%d ホップ, %d 回目）",
                     info["dest"], info["msg_id"], info["hops"], info["attempts"])
@@ -579,25 +597,35 @@ def _mesh_on_event(event: str, info: dict) -> None:
     elif event == "peer":
         logger.info("[MESH] ピア 0x%04X %s %s（指紋 %s）", info["addr"], info["role"],
                     info["name"], info["fingerprint"])
-    else:
+    elif event not in ("key_wait", "key_ready", "broadcast_relayed"):
         logger.info("[MESH] %s %s", event, info)
 
 
 def _start_mesh() -> threading.Thread:
-    global _mesh_node
+    global _mesh_node, _gateway, _ble_out
+    import os as _os
     from mesh.config import load_mesh_config, make_router_factory
+    from mesh.gateway import MeshGateway
     from mesh.realtime import E220Port, RealtimeNode
+    from mesh.store import Store
 
     mc = load_mesh_config(lora_e220_b.load_config_parser(), lora_e220_b.CONFIG_PATH)
     mc.address = lora_e220_b.SELF_ADDRESS          # --self-address を反映
     factory, identity, _ = make_router_factory(mc, on_event=_mesh_on_event)
     _mesh_node = RealtimeNode(E220Port(), factory, address=mc.address, on_deliver=_mesh_on_deliver)
+    _ble_out = asyncio.Queue()
+    store = Store(_os.path.join(mc.state_dir, "store.db"))
+    _gateway = MeshGateway(
+        _mesh_node, _mesh_node.router, store, _ble_notify_from_mesh,
+        info={"name": mc.node_name, "routing": mc.routing, "hop_limit": mc.hop_limit,
+              "group": mc.group_key is not None, "fingerprint": identity.fingerprint},
+        default_dest=lora_e220_b.TARGET_ADDRESS)
+    _mesh_node.post(_gateway.start)
     logger.info("[INIT] v2 メッシュ  self=0x%04X  役割=%s  経路=%s  hop_limit=%d  指紋=%s  グループ鍵=%s",
                 mc.address, mc.role, mc.routing, mc.hop_limit, identity.fingerprint,
                 "あり" if mc.group_key else "なし")
-    if lora_e220_b.TARGET_ADDRESS == 0xFFFF and mc.group_key is None:
-        logger.error("[INIT] 送信先がブロードキャストですが group_key_hex が未設定です。"
-                     "BLE からのメッセージは送れません")
+    if mc.group_key is None:
+        logger.warning("[INIT] group_key_hex が未設定のため、ブロードキャスト（チャット・災害投稿）を送れません")
     thread = threading.Thread(
         target=_mesh_node.run_forever, args=(_mesh_stop,),
         kwargs={"on_error": lambda e: logger.exception("[MESH] ループでエラー: %s", e)},
@@ -717,6 +745,7 @@ async def main() -> None:
             tasks.append(asyncio.create_task(_announce_loop()))
         logger.info("LPWA統合モード (v1) で起動 (送信・受信タスク開始)")
     else:
+        tasks.append(asyncio.create_task(_ble_notifier()))
         logger.info("LPWA統合モード (v2 メッシュ) で起動")
 
     try:

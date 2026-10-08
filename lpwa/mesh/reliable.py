@@ -196,10 +196,12 @@ class ReliableRouter(ManagedFloodRouter):
             self._tx(f, TxMeta("origin", key))
         if self.broadcast_retry and self._my_neighbors():
             k = self._dkey(frags[0])
-            wait = self._flood_hop_time(len(frags[0].encode())) + 2 * self.slot_time(P.MAX_PACKET)
             self._bcast_waits[k] = self.ctx.call_later(
-                wait, lambda: self._broadcast_retry(k, frags, key))
+                self._bcast_wait(frags[0]), lambda: self._broadcast_retry(k, frags, key))
         return key
+
+    def _bcast_wait(self, pkt: P.Packet) -> float:
+        return self._flood_hop_time(len(pkt.encode())) + 2 * self.slot_time(P.MAX_PACKET)
 
     def _broadcast_retry(self, k: tuple, frags: list[P.Packet], key: MessageKey) -> None:
         if self._bcast_waits.pop(k, None) is None:
@@ -207,6 +209,13 @@ class ReliableRouter(ManagedFloodRouter):
         self.stats.broadcast_retries += 1
         for f in frags:
             self._tx(f.with_attempt(1), TxMeta("retry", key))
+        # 再送の後も聞こえなければ「中継を確認できなかった」と知らせる
+        self._bcast_waits[k] = self.ctx.call_later(
+            self._bcast_wait(frags[0]), lambda: self._broadcast_unconfirmed(k))
+
+    def _broadcast_unconfirmed(self, k: tuple) -> None:
+        if self._bcast_waits.pop(k, None) is not None:
+            self._event("broadcast_unconfirmed", msg_id=k[1])
 
     def _send_data(self, dest: int, mid: int, payload: bytes) -> None:
         """宛先の鍵がある状態で呼ばれる（鍵待ちの保留から呼ばれることもある）。"""
@@ -546,9 +555,11 @@ class ReliableRouter(ManagedFloodRouter):
 
     def _on_duplicate(self, pkt: P.Packet) -> None:
         super()._on_duplicate(pkt)
-        t = self._bcast_waits.pop(self._dkey(pkt), None)
+        k = self._dkey(pkt)
+        t = self._bcast_waits.pop(k, None)
         if t is not None:
             t.cancel()          # 隣が中継した = 暗黙の ACK
+            self._event("broadcast_relayed", msg_id=k[1])
 
     def _maybe_relay(self, pkt: P.Packet, raw_len: int, rssi: int | None) -> None:
         if self.budget_used() > self.airtime_budget * self.budget_ratio:

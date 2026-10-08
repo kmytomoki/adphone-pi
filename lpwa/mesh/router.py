@@ -144,6 +144,7 @@ class ManagedFloodRouter:
             return key
         if self.nodedb.get(dest) is None:
             self._pending_tx.append(_PendingTx(self.ctx.now(), dest, mid, payload))
+            self._event("key_wait", dest=dest, msg_id=mid)
             self._request_key(dest)
             return key
         self._send_data(dest, mid, payload)
@@ -404,6 +405,7 @@ class ManagedFloodRouter:
                 self._event("send_expired", dest=p.dest, msg_id=p.msg_id)
             elif p.dest == peer:
                 self._send_data(p.dest, p.msg_id, p.payload)
+                self._event("key_ready", dest=p.dest, msg_id=p.msg_id)
             else:
                 keep.append(p)
         self._pending_tx = keep

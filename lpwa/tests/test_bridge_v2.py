@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import configparser
+import json
 import os
 import sys
 import tempfile
@@ -23,7 +24,9 @@ sys.path.insert(0, os.path.join(_LPWA_DIR, "tests"))
 
 import test_phase1_routing as phase1  # noqa: E402  (setting.ini と bless のスタブを用意する)
 
+from mesh import bleproto as B  # noqa: E402
 from mesh import packet as P  # noqa: E402
+from mesh.gateway import hello_payload  # noqa: E402
 from mesh.config import load_mesh_config, make_router_factory  # noqa: E402
 from mesh.realtime import RealtimeNode  # noqa: E402
 
@@ -144,6 +147,10 @@ class BridgeV2Test(unittest.TestCase):
             lora_e220_b.TARGET_ADDRESS = orig_target
             bridge._mesh_stop.set()
             bridge._mesh_node = None
+            if bridge._gateway is not None:
+                time.sleep(0.3)                 # メッシュのスレッドが止まるのを待ってから閉じる
+                bridge._gateway.store.close()
+            bridge._gateway = None
             bridge.server = None
         self.addCleanup(restore)
 
@@ -154,11 +161,32 @@ class BridgeV2Test(unittest.TestCase):
         got = []
         peer = RealtimeNode(_Port(hub, 7), factory, address=7, on_deliver=got.append)
 
+        def notified_frames():
+            r = B.Reassembler()
+            out = []
+            for c in bridge.server.notified:
+                got = r.add(c, 0)
+                if got:
+                    out.append(B.Frame.decode(got[1]))
+            return out
+
+        def statuses(app_id):
+            return [f.payload[0] for f in notified_frames()
+                    if f.kind == B.KIND_STATUS and f.msg_id == app_id]
+
+        tx = types.SimpleNamespace(uuid=bridge.TX_CHAR_UUID)
+
+        def phone_write(frame):
+            for c in B.chunk(frame.encode(), stream=5):
+                bridge.write_request(tx, bytearray(c))
+
         async def scenario():
             bridge._loop = asyncio.get_running_loop()
             bridge.server = _FakeServer()
             bridge._mesh_stop.clear()
+            lora_e220_b.TARGET_ADDRESS = 7          # 旧アプリの生テキストの送り先
             thread = bridge._start_mesh()
+            notifier = asyncio.create_task(bridge._ble_notifier())
             self.assertTrue(thread.is_alive())
 
             # 鍵を交換する
@@ -166,28 +194,39 @@ class BridgeV2Test(unittest.TestCase):
             peer.router.announce()
             await self._pump(peer, 0.5)
 
-            # BLE から書き込み → 相手に届く
-            lora_e220_b.TARGET_ADDRESS = 7
-            tx = types.SimpleNamespace(uuid=bridge.TX_CHAR_UUID)
-            bridge.write_request(tx, bytearray("物資が足りません".encode()))
-            await self._pump(peer, 1.0, until=lambda: got)
-            self.assertEqual([d.payload.decode() for d in got], ["物資が足りません"])
+            # スマホが HELLO → INFO が返る
+            phone_write(B.Frame(B.KIND_HELLO, payload=hello_payload(b"phone-01", 0)))
+            await self._pump(peer, 0.5, until=lambda: any(f.kind == B.KIND_INFO for f in notified_frames()))
+            info = json.loads([f for f in notified_frames() if f.kind == B.KIND_INFO][0].payload)
+            self.assertEqual((info["addr"], info["name"]), (lora_e220_b.SELF_ADDRESS, "避難所A"))
 
-            # 相手からブリッジ宛て → BLE に通知される
-            notified_before = len(bridge.server.notified)
+            # スマホ → 相手（7）。届いて、配送状態が「届いた」になる
+            phone_write(B.Frame(B.KIND_MSG, 100, dest=7, payload="物資が足りません".encode()))
+            await self._pump(peer, 3.0, until=lambda: B.ST_DELIVERED in statuses(100))
+            self.assertEqual([d.payload.decode() for d in got], ["物資が足りません"])
+            self.assertEqual(statuses(100), [B.ST_SENT, B.ST_DELIVERED])
+
+            # 相手からブリッジ宛て → スマホに MSG で通知される
             peer.router.send(lora_e220_b.SELF_ADDRESS, "了解".encode())
-            await self._pump(peer, 1.0, until=lambda: len(bridge.server.notified) > notified_before)
-            self.assertIn("了解".encode(), bridge.server.notified)
+            await self._pump(peer, 2.0, until=lambda: any(
+                f.kind == B.KIND_MSG and f.payload == "了解".encode() for f in notified_frames()))
+            msg = [f for f in notified_frames() if f.kind == B.KIND_MSG][-1]
+            self.assertEqual((msg.src, msg.payload.decode()), (7, "了解"))
 
             # グループ鍵でのブロードキャスト
-            lora_e220_b.TARGET_ADDRESS = P.BROADCAST_ADDR
-            bridge.write_request(tx, bytearray(b"all hands"))
-            await self._pump(peer, 1.0, until=lambda: len(got) >= 2)
-            self.assertEqual(got[-1].payload, b"all hands")
-            self.assertEqual(got[-1].dest, P.BROADCAST_ADDR)
+            phone_write(B.Frame(B.KIND_MSG, 101, dest=B.BROADCAST, payload=b"all hands"))
+            await self._pump(peer, 2.0, until=lambda: len(got) >= 2)
+            self.assertEqual((got[-1].payload, got[-1].dest), (b"all hands", P.BROADCAST_ADDR))
+            self.assertEqual(statuses(101)[0], B.ST_SENT)
+
+            # 旧アプリの生テキスト（エコーはしない）
+            bridge.write_request(tx, bytearray("ADCH|v1|旧".encode()))
+            await self._pump(peer, 2.0, until=lambda: len(got) >= 3)
+            self.assertEqual(got[-1].payload.decode(), "ADCH|v1|旧")
 
             bridge._mesh_stop.set()
             thread.join(2)
+            notifier.cancel()
 
         asyncio.run(scenario())
 
